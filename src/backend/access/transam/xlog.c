@@ -138,12 +138,18 @@ int			wal_retrieve_retry_interval = 5000;
 int			max_slot_wal_keep_size_mb = -1;
 int			wal_decode_buffer_size = 512 * 1024;
 bool		track_wal_io_timing = false;
+CommitSeqNo	startupCommitSeqNo = COMMITSEQNO_FIRST_NORMAL + 1;
 
 #ifdef WAL_DEBUG
 bool		XLOG_DEBUG = false;
 #endif
 
 int			wal_segment_size = DEFAULT_XLOG_SEG_SIZE;
+
+/* Hook for plugins to get control in CheckPointGuts() */
+CheckPoint_hook_type CheckPoint_hook = NULL;
+double CheckPointProgress;
+after_checkpoint_cleanup_hook_type after_checkpoint_cleanup_hook = NULL;
 
 /*
  * Number of WAL insertion locks to use. A higher value allows more insertions
@@ -4710,6 +4716,7 @@ BootStrapXLOG(void)
 	ShmemVariableCache->nextXid = checkPoint.nextXid;
 	ShmemVariableCache->nextOid = checkPoint.nextOid;
 	ShmemVariableCache->oidCount = 0;
+	pg_atomic_write_u64(&ShmemVariableCache->nextCommitSeqNo, COMMITSEQNO_FIRST_NORMAL + 1);
 	MultiXactSetNextMXact(checkPoint.nextMulti, checkPoint.nextMultiOffset);
 	AdvanceOldestClogXid(checkPoint.oldestXid);
 	SetTransactionIdLimit(checkPoint.oldestXid, checkPoint.oldestXidDB);
@@ -5049,6 +5056,7 @@ StartupXLOG(void)
 	XLogRecPtr	missingContrecPtr;
 	TransactionId oldestActiveXID;
 	bool		promoted = false;
+	bool		wasInRecovery;
 
 	/*
 	 * We should have an aux process resource owner to use, and we should not
@@ -5176,6 +5184,7 @@ StartupXLOG(void)
 	ShmemVariableCache->nextXid = checkPoint.nextXid;
 	ShmemVariableCache->nextOid = checkPoint.nextOid;
 	ShmemVariableCache->oidCount = 0;
+	pg_atomic_write_u64(&ShmemVariableCache->nextCommitSeqNo, startupCommitSeqNo);
 	MultiXactSetNextMXact(checkPoint.nextMulti, checkPoint.nextMultiOffset);
 	AdvanceOldestClogXid(checkPoint.oldestXid);
 	SetTransactionIdLimit(checkPoint.oldestXid, checkPoint.oldestXidDB);
@@ -5664,6 +5673,8 @@ StartupXLOG(void)
 	 */
 	PreallocXlogFiles(EndOfLog, newTLI);
 
+	wasInRecovery = InRecovery;
+
 	/*
 	 * Okay, we're officially UP.
 	 */
@@ -5741,6 +5752,9 @@ StartupXLOG(void)
 	 * commit timestamp.
 	 */
 	CompleteCommitTsInitialization();
+
+	if (wasInRecovery && after_checkpoint_cleanup_hook)
+		after_checkpoint_cleanup_hook(EndOfLog, 0);
 
 	/*
 	 * All done with end-of-recovery actions.
@@ -6866,6 +6880,9 @@ CreateCheckPoint(int flags)
 	if (!RecoveryInProgress())
 		TruncateSUBTRANS(GetOldestTransactionIdConsideredRunning());
 
+	if (after_checkpoint_cleanup_hook)
+		after_checkpoint_cleanup_hook(ProcLastRecPtr, flags);
+
 	/* Real work is done; log and update stats. */
 	LogCheckpointEnd(false);
 
@@ -7039,6 +7056,9 @@ CheckPointGuts(XLogRecPtr checkPointRedo, int flags)
 	CheckPointMultiXact();
 	CheckPointPredicate();
 	CheckPointBuffers(flags);
+
+	if (CheckPoint_hook)
+		CheckPoint_hook(checkPointRedo, flags);
 
 	/* Perform all queued up fsyncs */
 	TRACE_POSTGRESQL_BUFFER_CHECKPOINT_SYNC_START();
@@ -8580,6 +8600,19 @@ get_backup_status(void)
 }
 
 /*
+ * Check if there is a backup in progress.
+ *
+ * We do this check without lock assuming 32-bit reads are atomic.  In fact,
+ * the false result means that there was at least a moment of time when there
+ * were no backups.
+ */
+bool
+have_backup_in_progress(void)
+{
+	return (XLogCtl->Insert.runningBackups > 0);
+}
+
+/*
  * do_pg_backup_stop
  *
  * Utility function called at the end of an online backup.  It creates history
@@ -8988,3 +9021,5 @@ SetWalWriterSleeping(bool sleeping)
 	XLogCtl->WalWriterSleeping = sleeping;
 	SpinLockRelease(&XLogCtl->info_lck);
 }
+
+void (*RedoShutdownHook) (void) = NULL;

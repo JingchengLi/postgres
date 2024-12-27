@@ -227,7 +227,7 @@ table_index_fetch_tuple_check(Relation rel,
 
 	slot = table_slot_create(rel, NULL);
 	scan = table_index_fetch_begin(rel);
-	found = table_index_fetch_tuple(scan, tid, snapshot, slot, &call_again,
+	found = table_index_fetch_tuple(scan, PointerGetDatum(tid), snapshot, slot, &call_again,
 									all_dead);
 	table_index_fetch_end(scan);
 	ExecDropSingleTupleTableSlot(slot);
@@ -297,16 +297,23 @@ simple_table_tuple_insert(Relation rel, TupleTableSlot *slot)
  * via ereport().
  */
 void
-simple_table_tuple_delete(Relation rel, ItemPointer tid, Snapshot snapshot)
+simple_table_tuple_delete(Relation rel, Datum tupleid, Snapshot snapshot,
+						  TupleTableSlot *oldSlot)
 {
 	TM_Result	result;
 	TM_FailureData tmfd;
+	int			options = TABLE_MODIFY_WAIT;	/* wait for commit */
 
-	result = table_tuple_delete(rel, tid,
+	/* Fetch old tuple if the relevant slot is provided */
+	if (oldSlot)
+		options |= TABLE_MODIFY_FETCH_OLD_TUPLE;
+
+	result = table_tuple_delete(rel, tupleid,
 								GetCurrentCommandId(true),
 								snapshot, InvalidSnapshot,
-								true /* wait for commit */ ,
-								&tmfd, false /* changingPart */ );
+								options,
+								&tmfd, false /* changingPart */ ,
+								oldSlot);
 
 	switch (result)
 	{
@@ -342,20 +349,27 @@ simple_table_tuple_delete(Relation rel, ItemPointer tid, Snapshot snapshot)
  * via ereport().
  */
 void
-simple_table_tuple_update(Relation rel, ItemPointer otid,
+simple_table_tuple_update(Relation rel, Datum tupleid,
 						  TupleTableSlot *slot,
 						  Snapshot snapshot,
-						  TU_UpdateIndexes *update_indexes)
+						  TU_UpdateIndexes *update_indexes,
+						  TupleTableSlot *oldSlot)
 {
 	TM_Result	result;
 	TM_FailureData tmfd;
 	LockTupleMode lockmode;
+	int			options = TABLE_MODIFY_WAIT;	/* wait for commit */
 
-	result = table_tuple_update(rel, otid, slot,
+	/* Fetch old tuple if the relevant slot is provided */
+	if (oldSlot)
+		options |= TABLE_MODIFY_FETCH_OLD_TUPLE;
+
+	result = table_tuple_update(rel, tupleid, slot,
 								GetCurrentCommandId(true),
 								snapshot, InvalidSnapshot,
-								true /* wait for commit */ ,
-								&tmfd, &lockmode, update_indexes);
+								options,
+								&tmfd, &lockmode, update_indexes,
+								oldSlot);
 
 	switch (result)
 	{

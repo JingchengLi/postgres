@@ -107,10 +107,40 @@ typedef void (*ambuildempty_function) (Relation indexRelation);
 typedef bool (*aminsert_function) (Relation indexRelation,
 								   Datum *values,
 								   bool *isnull,
-								   ItemPointer heap_tid,
+								   ItemPointer tupleid,
 								   Relation heapRelation,
 								   IndexUniqueCheck checkUnique,
 								   bool indexUnchanged,
+								   struct IndexInfo *indexInfo);
+
+/* extended version of aminsert taking Datum tupleid */
+typedef bool (*aminsert_extended_function) (Relation indexRelation,
+								   Datum *values,
+								   bool *isnull,
+								   Datum tupleid,
+								   Relation heapRelation,
+								   IndexUniqueCheck checkUnique,
+								   bool indexUnchanged,
+								   struct IndexInfo *indexInfo);
+
+/* update this tuple */
+typedef bool (*amupdate_function) (Relation indexRelation,
+								   bool new_valid,
+								   bool old_valid,
+								   Datum *values,
+								   bool *isnull,
+								   Datum tupleid,
+								   Datum *valuesOld,
+								   bool *isnullOld,
+								   Datum oldTupleid,
+								   Relation heapRelation,
+								   IndexUniqueCheck checkUnique,
+								   struct IndexInfo *indexInfo);
+/* delete this tuple */
+typedef bool (*amdelete_function) (Relation indexRelation,
+								   Datum *values, bool *isnull,
+								   Datum tupleid,
+								   Relation heapRelation,
 								   struct IndexInfo *indexInfo);
 
 /* bulk delete */
@@ -246,6 +276,8 @@ typedef struct IndexAmRoutine
 	bool		amusemaintenanceworkmem;
 	/* does AM store tuple information only at block granularity? */
 	bool		amsummarizing;
+	/* does AM can provide MVCC */
+	bool		ammvccaware;
 	/* OR of parallel vacuum flags.  See vacuum.h for flags. */
 	uint8		amparallelvacuumoptions;
 	/* type of data stored in index, or InvalidOid if variable */
@@ -261,6 +293,9 @@ typedef struct IndexAmRoutine
 	ambuild_function ambuild;
 	ambuildempty_function ambuildempty;
 	aminsert_function aminsert;
+	aminsert_extended_function aminsertextended;
+	amupdate_function amupdate;
+	amdelete_function amdelete;
 	ambulkdelete_function ambulkdelete;
 	amvacuumcleanup_function amvacuumcleanup;
 	amcanreturn_function amcanreturn;	/* can be NULL */
@@ -286,7 +321,13 @@ typedef struct IndexAmRoutine
 
 
 /* Functions in access/index/amapi.c */
+extern IndexAmRoutine *GetIndexAmRoutineWithTableAM(Oid tamoid, Oid amhandler);
 extern IndexAmRoutine *GetIndexAmRoutine(Oid amhandler);
-extern IndexAmRoutine *GetIndexAmRoutineByAmId(Oid amoid, bool noerror);
+extern IndexAmRoutine *GetIndexAmRoutineExtended(Oid indoid, Oid amhandler);
+extern IndexAmRoutine *GetIndexAmRoutineByAmId(Oid indoid, Oid amoid, bool noerror);
+
+typedef IndexAmRoutine *(*IndexAMRoutineHookType) (Oid tamoid, Oid amhandler);
+
+extern IndexAMRoutineHookType IndexAMRoutineHook;
 
 #endif							/* AMAPI_H */

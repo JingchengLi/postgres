@@ -23,6 +23,7 @@
 #include "access/heapam.h"
 #include "access/heaptoast.h"
 #include "access/multixact.h"
+#include "access/reloptions.h"
 #include "access/rewriteheap.h"
 #include "access/syncscan.h"
 #include "access/tableam.h"
@@ -44,6 +45,12 @@
 #include "storage/smgr.h"
 #include "utils/builtins.h"
 #include "utils/rel.h"
+
+static TM_Result heapam_tuple_lock(Relation relation, Datum tid,
+								   Snapshot snapshot, TupleTableSlot *slot,
+								   CommandId cid, LockTupleMode mode,
+								   LockWaitPolicy wait_policy, uint8 flags,
+								   TM_FailureData *tmfd);
 
 static void reform_and_rewrite_tuple(HeapTuple tuple,
 									 Relation OldHeap, Relation NewHeap,
@@ -67,6 +74,20 @@ static const TupleTableSlotOps *
 heapam_slot_callbacks(Relation relation)
 {
 	return &TTSOpsBufferHeapTuple;
+}
+
+static RowRefType
+heapam_get_row_ref_type(Relation rel)
+{
+	return ROW_REF_TID;
+}
+
+static void
+heapam_free_rd_amcache(Relation rel)
+{
+	if (rel->rd_amcache)
+		pfree(rel->rd_amcache);
+	rel->rd_amcache = NULL;
 }
 
 
@@ -110,7 +131,7 @@ heapam_index_fetch_end(IndexFetchTableData *scan)
 
 static bool
 heapam_index_fetch_tuple(struct IndexFetchTableData *scan,
-						 ItemPointer tid,
+						 Datum tupleid,
 						 Snapshot snapshot,
 						 TupleTableSlot *slot,
 						 bool *call_again, bool *all_dead)
@@ -118,6 +139,7 @@ heapam_index_fetch_tuple(struct IndexFetchTableData *scan,
 	IndexFetchHeapData *hscan = (IndexFetchHeapData *) scan;
 	BufferHeapTupleTableSlot *bslot = (BufferHeapTupleTableSlot *) slot;
 	bool		got_heap_tuple;
+	ItemPointer tid = DatumGetItemPointer(tupleid);
 
 	Assert(TTS_IS_BUFFERTUPLE(slot));
 
@@ -178,7 +200,7 @@ heapam_index_fetch_tuple(struct IndexFetchTableData *scan,
 
 static bool
 heapam_fetch_row_version(Relation relation,
-						 ItemPointer tid,
+						 Datum tupleid,
 						 Snapshot snapshot,
 						 TupleTableSlot *slot)
 {
@@ -187,7 +209,7 @@ heapam_fetch_row_version(Relation relation,
 
 	Assert(TTS_IS_BUFFERTUPLE(slot));
 
-	bslot->base.tupdata.t_self = *tid;
+	bslot->base.tupdata.t_self = *DatumGetItemPointer(tupleid);
 	if (heap_fetch(relation, snapshot, &bslot->base.tupdata, &buffer, false))
 	{
 		/* store in slot, transferring existing pin */
@@ -237,7 +259,7 @@ heapam_tuple_satisfies_snapshot(Relation rel, TupleTableSlot *slot,
  * ----------------------------------------------------------------------------
  */
 
-static void
+static TupleTableSlot *
 heapam_tuple_insert(Relation relation, TupleTableSlot *slot, CommandId cid,
 					int options, BulkInsertState bistate)
 {
@@ -254,6 +276,8 @@ heapam_tuple_insert(Relation relation, TupleTableSlot *slot, CommandId cid,
 
 	if (shouldFree)
 		pfree(tuple);
+
+	return slot;
 }
 
 static void
@@ -296,36 +320,341 @@ heapam_tuple_complete_speculative(Relation relation, TupleTableSlot *slot,
 		pfree(tuple);
 }
 
-static TM_Result
-heapam_tuple_delete(Relation relation, ItemPointer tid, CommandId cid,
-					Snapshot snapshot, Snapshot crosscheck, bool wait,
-					TM_FailureData *tmfd, bool changingPart)
+/*
+ * ExecCheckTupleVisible -- verify tuple is visible
+ *
+ * It would not be consistent with guarantees of the higher isolation levels to
+ * proceed with avoiding insertion (taking speculative insertion's alternative
+ * path) on the basis of another tuple that is not visible to MVCC snapshot.
+ * Check for the need to raise a serialization failure, and do so as necessary.
+ */
+static void
+ExecCheckTupleVisible(EState *estate,
+					  Relation rel,
+					  TupleTableSlot *slot)
 {
+	if (!IsolationUsesXactSnapshot())
+		return;
+
+	if (!table_tuple_satisfies_snapshot(rel, slot, estate->es_snapshot))
+	{
+		Datum		xminDatum;
+		TransactionId xmin;
+		bool		isnull;
+
+		xminDatum = slot_getsysattr(slot, MinTransactionIdAttributeNumber, &isnull);
+		Assert(!isnull);
+		xmin = DatumGetTransactionId(xminDatum);
+
+		/*
+		 * We should not raise a serialization failure if the conflict is
+		 * against a tuple inserted by our own transaction, even if it's not
+		 * visible to our snapshot.  (This would happen, for example, if
+		 * conflicting keys are proposed for insertion in a single command.)
+		 */
+		if (!TransactionIdIsCurrentTransactionId(xmin))
+			ereport(ERROR,
+					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+					 errmsg("could not serialize access due to concurrent update")));
+	}
+}
+
+/*
+ * ExecCheckTIDVisible -- convenience variant of ExecCheckTupleVisible()
+ */
+static void
+ExecCheckTIDVisible(EState *estate,
+					Relation rel,
+					ItemPointer tid,
+					TupleTableSlot *tempSlot)
+{
+	/* Redundantly check isolation level */
+	if (!IsolationUsesXactSnapshot())
+		return;
+
+	if (!table_tuple_fetch_row_version(rel, PointerGetDatum(tid),
+									   SnapshotAny, tempSlot))
+		elog(ERROR, "failed to fetch conflicting tuple for ON CONFLICT");
+	ExecCheckTupleVisible(estate, rel, tempSlot);
+	ExecClearTuple(tempSlot);
+}
+
+static inline TupleTableSlot *
+heapam_tuple_insert_with_arbiter(ResultRelInfo *resultRelInfo,
+								 TupleTableSlot *slot,
+								 CommandId cid, int options,
+								 struct BulkInsertStateData *bistate,
+								 List *arbiterIndexes,
+								 EState *estate,
+								 LockTupleMode lockmode,
+								 TupleTableSlot *lockedSlot,
+								 TupleTableSlot *tempSlot)
+{
+	Relation	rel = resultRelInfo->ri_RelationDesc;
+	uint32		specToken;
+	ItemPointerData conflictTid;
+	bool		specConflict;
+	List	   *recheckIndexes = NIL;
+
+	while (true)
+	{
+		specConflict = false;
+		if (!ExecCheckIndexConstraints(resultRelInfo, slot, estate, &conflictTid,
+									   arbiterIndexes))
+		{
+			if (lockedSlot)
+			{
+				TM_Result	test;
+				TM_FailureData tmfd;
+				Datum		xminDatum;
+				TransactionId xmin;
+				bool		isnull;
+
+				/* Determine lock mode to use */
+				lockmode = ExecUpdateLockMode(estate, resultRelInfo);
+
+				/*
+				 * Lock tuple for update.  Don't follow updates when tuple cannot be
+				* locked without doing so.  A row locking conflict here means our
+				* previous conclusion that the tuple is conclusively committed is not
+				* true anymore.
+				*/
+				test = table_tuple_lock(rel, PointerGetDatum(&conflictTid),
+										estate->es_snapshot,
+										lockedSlot, estate->es_output_cid,
+										lockmode, LockWaitBlock, 0,
+										&tmfd);
+				switch (test)
+				{
+					case TM_Ok:
+						/* success! */
+						break;
+
+					case TM_Invisible:
+
+						/*
+						 * This can occur when a just inserted tuple is updated again in
+						* the same command. E.g. because multiple rows with the same
+						* conflicting key values are inserted.
+						*
+						* This is somewhat similar to the ExecUpdate() TM_SelfModified
+						* case.  We do not want to proceed because it would lead to the
+						* same row being updated a second time in some unspecified order,
+						* and in contrast to plain UPDATEs there's no historical behavior
+						* to break.
+						*
+						* It is the user's responsibility to prevent this situation from
+						* occurring.  These problems are why the SQL standard similarly
+						* specifies that for SQL MERGE, an exception must be raised in
+						* the event of an attempt to update the same row twice.
+						*/
+						xminDatum = slot_getsysattr(lockedSlot,
+													MinTransactionIdAttributeNumber,
+													&isnull);
+						Assert(!isnull);
+						xmin = DatumGetTransactionId(xminDatum);
+
+						if (TransactionIdIsCurrentTransactionId(xmin))
+							ereport(ERROR,
+									(errcode(ERRCODE_CARDINALITY_VIOLATION),
+							/* translator: %s is a SQL command name */
+									errmsg("%s command cannot affect row a second time",
+											"ON CONFLICT DO UPDATE"),
+									errhint("Ensure that no rows proposed for insertion within the same command have duplicate constrained values.")));
+
+						/* This shouldn't happen */
+						elog(ERROR, "attempted to lock invisible tuple");
+						break;
+
+					case TM_SelfModified:
+
+						/*
+						 * This state should never be reached. As a dirty snapshot is used
+						* to find conflicting tuples, speculative insertion wouldn't have
+						* seen this row to conflict with.
+						*/
+						elog(ERROR, "unexpected self-updated tuple");
+						break;
+
+					case TM_Updated:
+						if (IsolationUsesXactSnapshot())
+							ereport(ERROR,
+									(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+									errmsg("could not serialize access due to concurrent update")));
+
+						/*
+						 * As long as we don't support an UPDATE of INSERT ON CONFLICT for
+						* a partitioned table we shouldn't reach to a case where tuple to
+						* be lock is moved to another partition due to concurrent update
+						* of the partition key.
+						*/
+						Assert(!ItemPointerIndicatesMovedPartitions(&tmfd.ctid));
+
+						/*
+						 * Tell caller to try again from the very start.
+						*
+						* It does not make sense to use the usual EvalPlanQual() style
+						* loop here, as the new version of the row might not conflict
+						* anymore, or the conflicting tuple has actually been deleted.
+						*/
+						ExecClearTuple(lockedSlot);
+						return false;
+
+					case TM_Deleted:
+						if (IsolationUsesXactSnapshot())
+							ereport(ERROR,
+									(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+									errmsg("could not serialize access due to concurrent delete")));
+
+						/* see TM_Updated case */
+						Assert(!ItemPointerIndicatesMovedPartitions(&tmfd.ctid));
+						ExecClearTuple(lockedSlot);
+						return false;
+
+					default:
+						elog(ERROR, "unrecognized table_tuple_lock status: %u", test);
+				}
+
+				/* Success, the tuple is locked. */
+
+				/*
+				 * Verify that the tuple is visible to our MVCC snapshot if the current
+				* isolation level mandates that.
+				*
+				* It's not sufficient to rely on the check within ExecUpdate() as e.g.
+				* CONFLICT ... WHERE clause may prevent us from reaching that.
+				*
+				* This means we only ever continue when a new command in the current
+				* transaction could see the row, even though in READ COMMITTED mode the
+				* tuple will not be visible according to the current statement's
+				* snapshot.  This is in line with the way UPDATE deals with newer tuple
+				* versions.
+				*/
+				ExecCheckTupleVisible(estate, rel, lockedSlot);
+				return NULL;
+			}
+			else
+			{
+				ExecCheckTIDVisible(estate, rel, &conflictTid, tempSlot);
+				return NULL;
+			}
+		}
+
+		/*
+		 * Before we start insertion proper, acquire our "speculative
+		 * insertion lock".  Others can use that to wait for us to decide
+		 * if we're going to go ahead with the insertion, instead of
+		 * waiting for the whole transaction to complete.
+		 */
+		specToken = SpeculativeInsertionLockAcquire(GetCurrentTransactionId());
+
+		/* insert the tuple, with the speculative token */
+		heapam_tuple_insert_speculative(rel, slot,
+										estate->es_output_cid,
+										0,
+										NULL,
+										specToken);
+
+		/* insert index entries for tuple */
+		recheckIndexes = ExecInsertIndexTuples(resultRelInfo,
+											   slot, estate, false, true,
+											   &specConflict,
+											   arbiterIndexes,
+											   false);
+
+		/* adjust the tuple's state accordingly */
+		heapam_tuple_complete_speculative(rel, slot,
+										  specToken, !specConflict);
+
+		/*
+		 * Wake up anyone waiting for our decision.  They will re-check
+		 * the tuple, see that it's no longer speculative, and wait on our
+		 * XID as if this was a regularly inserted tuple all along.  Or if
+		 * we killed the tuple, they will see it's dead, and proceed as if
+		 * the tuple never existed.
+		 */
+		SpeculativeInsertionLockRelease(GetCurrentTransactionId());
+
+		/*
+		 * If there was a conflict, start from the beginning.  We'll do
+		 * the pre-check again, which will now find the conflicting tuple
+		 * (unless it aborts before we get there).
+		 */
+		if (specConflict)
+		{
+			list_free(recheckIndexes);
+			CHECK_FOR_INTERRUPTS();
+			continue;
+		}
+
+		return slot;
+	}
+}
+
+static TM_Result
+heapam_tuple_delete(Relation relation, Datum tupleid, CommandId cid,
+					Snapshot snapshot, Snapshot crosscheck, int options,
+					TM_FailureData *tmfd, bool changingPart,
+					TupleTableSlot *oldSlot)
+{
+	TM_Result	result;
+	ItemPointer tid = DatumGetItemPointer(tupleid);
+
 	/*
 	 * Currently Deleting of index tuples are handled at vacuum, in case if
 	 * the storage itself is cleaning the dead tuples by itself, it is the
 	 * time to call the index tuple deletion also.
 	 */
-	return heap_delete(relation, tid, cid, crosscheck, wait, tmfd, changingPart);
+	result = heap_delete(relation, tid, cid, crosscheck, options,
+						 tmfd, changingPart, oldSlot);
+
+	/*
+	 * If the tuple has been concurrently updated, then get the lock on it.
+	 * (Do only if caller asked for this by setting the
+	 * TABLE_MODIFY_LOCK_UPDATED option)  With the lock held retry of the
+	 * delete should succeed even if there are more concurrent update
+	 * attempts.
+	 */
+	if (result == TM_Updated && (options & TABLE_MODIFY_LOCK_UPDATED))
+	{
+		/*
+		 * heapam_tuple_lock() will take advantage of tuple loaded into
+		 * oldSlot by heap_delete().
+		 */
+		result = heapam_tuple_lock(relation, tupleid, snapshot,
+								   oldSlot, cid, LockTupleExclusive,
+								   (options & TABLE_MODIFY_WAIT) ?
+								   LockWaitBlock :
+								   LockWaitSkip,
+								   TUPLE_LOCK_FLAG_FIND_LAST_VERSION,
+								   tmfd);
+
+		if (result == TM_Ok)
+			return TM_Updated;
+	}
+
+	return result;
 }
 
 
 static TM_Result
-heapam_tuple_update(Relation relation, ItemPointer otid, TupleTableSlot *slot,
+heapam_tuple_update(Relation relation, Datum tupleid, TupleTableSlot *slot,
 					CommandId cid, Snapshot snapshot, Snapshot crosscheck,
-					bool wait, TM_FailureData *tmfd,
-					LockTupleMode *lockmode, TU_UpdateIndexes *update_indexes)
+					int options, TM_FailureData *tmfd,
+					LockTupleMode *lockmode, TU_UpdateIndexes *update_indexes,
+					TupleTableSlot *oldSlot)
 {
 	bool		shouldFree = true;
 	HeapTuple	tuple = ExecFetchSlotHeapTuple(slot, true, &shouldFree);
 	TM_Result	result;
+	ItemPointer otid = DatumGetItemPointer(tupleid);
 
 	/* Update the tuple with table oid */
 	slot->tts_tableOid = RelationGetRelid(relation);
 	tuple->t_tableOid = slot->tts_tableOid;
 
-	result = heap_update(relation, otid, tuple, cid, crosscheck, wait,
-						 tmfd, lockmode, update_indexes);
+	result = heap_update(relation, otid, tuple, cid, crosscheck, options,
+						 tmfd, lockmode, update_indexes, oldSlot);
 	ItemPointerCopy(&tuple->t_self, &slot->tts_tid);
 
 	/*
@@ -352,19 +681,44 @@ heapam_tuple_update(Relation relation, ItemPointer otid, TupleTableSlot *slot,
 	if (shouldFree)
 		pfree(tuple);
 
+	/*
+	 * If the tuple has been concurrently updated, then get the lock on it.
+	 * (Do only if caller asked for this by setting the
+	 * TABLE_MODIFY_LOCK_UPDATED option)  With the lock held retry of the
+	 * update should succeed even if there are more concurrent update
+	 * attempts.
+	 */
+	if (result == TM_Updated && (options & TABLE_MODIFY_LOCK_UPDATED))
+	{
+		/*
+		 * heapam_tuple_lock() will take advantage of tuple loaded into
+		 * oldSlot by heap_update().
+		 */
+		result = heapam_tuple_lock(relation, tupleid, snapshot,
+								   oldSlot, cid, *lockmode,
+								   (options & TABLE_MODIFY_WAIT) ?
+								   LockWaitBlock :
+								   LockWaitSkip,
+								   TUPLE_LOCK_FLAG_FIND_LAST_VERSION,
+								   tmfd);
+
+		if (result == TM_Ok)
+			return TM_Updated;
+	}
+
 	return result;
 }
 
 static TM_Result
-heapam_tuple_lock(Relation relation, ItemPointer tid, Snapshot snapshot,
+heapam_tuple_lock(Relation relation, Datum tupleid, Snapshot snapshot,
 				  TupleTableSlot *slot, CommandId cid, LockTupleMode mode,
 				  LockWaitPolicy wait_policy, uint8 flags,
 				  TM_FailureData *tmfd)
 {
 	BufferHeapTupleTableSlot *bslot = (BufferHeapTupleTableSlot *) slot;
 	TM_Result	result;
-	Buffer		buffer;
 	HeapTuple	tuple = &bslot->base.tupdata;
+	ItemPointer tid = DatumGetItemPointer(tupleid);
 	bool		follow_updates;
 
 	follow_updates = (flags & TUPLE_LOCK_FLAG_LOCK_UPDATE_IN_PROGRESS) != 0;
@@ -373,17 +727,14 @@ heapam_tuple_lock(Relation relation, ItemPointer tid, Snapshot snapshot,
 	Assert(TTS_IS_BUFFERTUPLE(slot));
 
 tuple_lock_retry:
-	tuple->t_self = *tid;
-	result = heap_lock_tuple(relation, tuple, cid, mode, wait_policy,
-							 follow_updates, &buffer, tmfd);
+	result = heap_lock_tuple(relation, tid, slot, cid, mode, wait_policy,
+							 follow_updates, tmfd);
 
 	if (result == TM_Updated &&
 		(flags & TUPLE_LOCK_FLAG_FIND_LAST_VERSION))
 	{
 		/* Should not encounter speculative tuple on recheck */
 		Assert(!HeapTupleHeaderIsSpeculative(tuple->t_data));
-
-		ReleaseBuffer(buffer);
 
 		if (!ItemPointerEquals(&tmfd->ctid, &tuple->t_self))
 		{
@@ -406,6 +757,8 @@ tuple_lock_retry:
 			InitDirtySnapshot(SnapshotDirty);
 			for (;;)
 			{
+				Buffer		buffer = InvalidBuffer;
+
 				if (ItemPointerIndicatesMovedPartitions(tid))
 					ereport(ERROR,
 							(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
@@ -500,7 +853,7 @@ tuple_lock_retry:
 					/*
 					 * This is a live tuple, so try to lock it again.
 					 */
-					ReleaseBuffer(buffer);
+					ExecStorePinnedBufferHeapTuple(tuple, slot, buffer);
 					goto tuple_lock_retry;
 				}
 
@@ -511,7 +864,7 @@ tuple_lock_retry:
 				 */
 				if (tuple->t_data == NULL)
 				{
-					Assert(!BufferIsValid(buffer));
+					ReleaseBuffer(buffer);
 					return TM_Deleted;
 				}
 
@@ -563,9 +916,6 @@ tuple_lock_retry:
 
 	slot->tts_tableOid = RelationGetRelid(relation);
 	tuple->t_tableOid = slot->tts_tableOid;
-
-	/* store in slot, transferring existing pin */
-	ExecStorePinnedBufferHeapTuple(tuple, slot, buffer);
 
 	return result;
 }
@@ -2536,6 +2886,29 @@ SampleHeapTupleVisible(TableScanDesc scan, Buffer buffer,
 	}
 }
 
+static bool
+heapam_tuple_is_current(Relation rel, TupleTableSlot *slot)
+{
+	Datum		xminDatum;
+	TransactionId xmin;
+	bool		isnull;
+
+	xminDatum = slot_getsysattr(slot, MinTransactionIdAttributeNumber, &isnull);
+	Assert(!isnull);
+	xmin = DatumGetTransactionId(xminDatum);
+	return TransactionIdIsCurrentTransactionId(xmin);
+}
+
+static bytea *
+heapam_reloptions(char relkind, Datum reloptions, bool validate)
+{
+	if (relkind == RELKIND_RELATION ||
+		relkind == RELKIND_TOASTVALUE ||
+		relkind == RELKIND_MATVIEW)
+		return heap_reloptions(relkind, reloptions, validate);
+
+	return NULL;
+}
 
 /* ------------------------------------------------------------------------
  * Definition of the heap table access method.
@@ -2546,6 +2919,8 @@ static const TableAmRoutine heapam_methods = {
 	.type = T_TableAmRoutine,
 
 	.slot_callbacks = heapam_slot_callbacks,
+	.get_row_ref_type = heapam_get_row_ref_type,
+	.free_rd_amcache = heapam_free_rd_amcache,
 
 	.scan_begin = heap_beginscan,
 	.scan_end = heap_endscan,
@@ -2565,8 +2940,7 @@ static const TableAmRoutine heapam_methods = {
 	.index_fetch_tuple = heapam_index_fetch_tuple,
 
 	.tuple_insert = heapam_tuple_insert,
-	.tuple_insert_speculative = heapam_tuple_insert_speculative,
-	.tuple_complete_speculative = heapam_tuple_complete_speculative,
+	.tuple_insert_with_arbiter = heapam_tuple_insert_with_arbiter,
 	.multi_insert = heap_multi_insert,
 	.tuple_delete = heapam_tuple_delete,
 	.tuple_update = heapam_tuple_update,
@@ -2598,7 +2972,11 @@ static const TableAmRoutine heapam_methods = {
 	.scan_bitmap_next_block = heapam_scan_bitmap_next_block,
 	.scan_bitmap_next_tuple = heapam_scan_bitmap_next_tuple,
 	.scan_sample_next_block = heapam_scan_sample_next_block,
-	.scan_sample_next_tuple = heapam_scan_sample_next_tuple
+	.scan_sample_next_tuple = heapam_scan_sample_next_tuple,
+
+	.tuple_is_current = heapam_tuple_is_current,
+
+	.reloptions = heapam_reloptions
 };
 
 

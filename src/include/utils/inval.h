@@ -22,6 +22,7 @@ extern PGDLLIMPORT int debug_discard_caches;
 
 typedef void (*SyscacheCallbackFunction) (Datum arg, int cacheid, uint32 hashvalue);
 typedef void (*RelcacheCallbackFunction) (Datum arg, Oid relid);
+typedef void (*UsercacheCallbackFunction) (Datum arg, Oid arg1, Oid arg2, Oid arg3);
 
 
 extern void AcceptInvalidationMessages(void);
@@ -48,6 +49,8 @@ extern void CacheInvalidateRelcacheByTuple(HeapTuple classTuple);
 
 extern void CacheInvalidateRelcacheByRelid(Oid relid);
 
+extern void CacheInvalidateRelcacheByDbidRelid(Oid dbid, Oid relid);
+
 extern void CacheInvalidateSmgr(RelFileLocatorBackend rlocator);
 
 extern void CacheInvalidateRelmap(Oid databaseId);
@@ -57,6 +60,9 @@ extern void CacheRegisterSyscacheCallback(int cacheid,
 										  Datum arg);
 
 extern void CacheRegisterRelcacheCallback(RelcacheCallbackFunction func,
+										  Datum arg);
+
+extern void CacheRegisterUsercacheCallback(UsercacheCallbackFunction func,
 										  Datum arg);
 
 extern void CallSyscacheCallbacks(int cacheid, uint32 hashvalue);

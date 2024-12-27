@@ -218,23 +218,98 @@ bool
 index_insert(Relation indexRelation,
 			 Datum *values,
 			 bool *isnull,
-			 ItemPointer heap_t_ctid,
+			 ItemPointer tupleid,
 			 Relation heapRelation,
 			 IndexUniqueCheck checkUnique,
 			 bool indexUnchanged,
 			 IndexInfo *indexInfo)
 {
 	RELATION_CHECKS;
-	CHECK_REL_PROCEDURE(aminsert);
+
+	if (indexRelation->rd_indam->aminsertextended == NULL && indexRelation->rd_indam->aminsert == NULL )
+		elog(ERROR, "at least one function aminsert or aminsertextended should be defined for index \"%s\"", \
+			RelationGetRelationName(indexRelation));
 
 	if (!(indexRelation->rd_indam->ampredlocks))
 		CheckForSerializableConflictIn(indexRelation,
 									   (ItemPointer) NULL,
 									   InvalidBlockNumber);
 
-	return indexRelation->rd_indam->aminsert(indexRelation, values, isnull,
-											 heap_t_ctid, heapRelation,
+	if (indexRelation->rd_indam->aminsert)
+	{
+		/* compatibility method for extension AM's not aware of aminsertextended */
+		return indexRelation->rd_indam->aminsert(indexRelation, values, isnull,
+											 tupleid, heapRelation,
 											 checkUnique, indexUnchanged,
+											 indexInfo);
+	}
+	else
+	{
+		/* index insert method for internal AM's and Orioledb that are aware of aminsertextended */
+		return indexRelation->rd_indam->aminsertextended(indexRelation, values, isnull,
+											 ItemPointerGetDatum(tupleid), heapRelation,
+											 checkUnique, indexUnchanged,
+											 indexInfo);
+	}
+}
+
+/* ----------------
+ *		index_update - update an index tuple in a relation
+ * ----------------
+ */
+bool
+index_update(Relation indexRelation,
+			 bool new_valid,
+			 bool old_valid,
+			 Datum *values,
+			 bool *isnull,
+			 Datum tupleid,
+			 Datum *valuesOld,
+			 bool *isnullOld,
+			 Datum oldTupleid,
+			 Relation heapRelation,
+			 IndexUniqueCheck checkUnique,
+			 IndexInfo *indexInfo)
+{
+	RELATION_CHECKS;
+	CHECK_REL_PROCEDURE(amupdate);
+
+	if (!(indexRelation->rd_indam->ampredlocks))
+		CheckForSerializableConflictIn(indexRelation,
+									   (ItemPointer) NULL,
+									   InvalidBlockNumber);
+
+	return indexRelation->rd_indam->amupdate(indexRelation,
+											 new_valid, old_valid,
+											 values, isnull, tupleid,
+											 valuesOld, isnullOld, oldTupleid,
+											 heapRelation,
+											 checkUnique,
+											 indexInfo);
+}
+
+
+/* ----------------
+ *		index_delete - delete an index tuple from a relation
+ * ----------------
+ */
+bool
+index_delete(Relation indexRelation,
+			 Datum *values, bool *isnull, Datum tupleid,
+			 Relation heapRelation,
+			 IndexInfo *indexInfo)
+{
+	RELATION_CHECKS;
+	CHECK_REL_PROCEDURE(amdelete);
+
+	if (!(indexRelation->rd_indam->ampredlocks))
+		CheckForSerializableConflictIn(indexRelation,
+									   (ItemPointer) NULL,
+									   InvalidBlockNumber);
+
+	return indexRelation->rd_indam->amdelete(indexRelation,
+											 values, isnull, tupleid,
+											 heapRelation,
 											 indexInfo);
 }
 
@@ -604,6 +679,55 @@ index_getnext_tid(IndexScanDesc scan, ScanDirection direction)
 }
 
 /* ----------------
+ * index_getnext_rowid - get the next ROWID from a scan
+ *
+ * The result is the next ROWID satisfying the scan keys,
+ * or isnull if no more matching tuples exist.
+ * ----------------
+ */
+NullableDatum
+index_getnext_rowid(IndexScanDesc scan, ScanDirection direction)
+{
+	NullableDatum result;
+	bool		found;
+
+	SCAN_CHECKS;
+	CHECK_SCAN_PROCEDURE(amgettuple);
+
+	/* XXX: we should assert that a snapshot is pushed or registered */
+	Assert(TransactionIdIsValid(RecentXmin));
+
+	/*
+	 * The AM's amgettuple proc finds the next index entry matching the scan
+	 * keys, and puts the TID into scan->xs_heaptid.  It should also set
+	 * scan->xs_recheck and possibly scan->xs_itup/scan->xs_hitup, though we
+	 * pay no attention to those fields here.
+	 */
+	found = scan->indexRelation->rd_indam->amgettuple(scan, direction);
+
+	/* Reset kill flag immediately for safety */
+	scan->kill_prior_tuple = false;
+	scan->xs_heap_continue = false;
+
+	/* If we're out of index entries, we're done */
+	if (!found)
+	{
+		/* release resources (like buffer pins) from table accesses */
+		if (scan->xs_heapfetch)
+			table_index_fetch_reset(scan->xs_heapfetch);
+
+		result.isnull = true;
+		return result;
+	}
+	/* Assert(RowidIsValid(&scan->xs_rowid)); */
+
+	pgstat_count_index_tuples(scan->indexRelation, 1);
+
+	/* Return the ROWID of the tuple we found. */
+	return scan->xs_rowid;
+}
+
+/* ----------------
  *		index_fetch_heap - get the scan's next heap tuple
  *
  * The result is a visible heap tuple associated with the index TID most
@@ -626,8 +750,17 @@ index_fetch_heap(IndexScanDesc scan, TupleTableSlot *slot)
 {
 	bool		all_dead = false;
 	bool		found;
+	Datum		tupleid;
 
-	found = table_index_fetch_tuple(scan->xs_heapfetch, &scan->xs_heaptid,
+	if (scan->xs_want_rowid)
+	{
+		Assert(!scan->xs_rowid.isnull);
+		tupleid = scan->xs_rowid.value;
+	}
+	else
+		tupleid = PointerGetDatum(&scan->xs_heaptid);
+
+	found = table_index_fetch_tuple(scan->xs_heapfetch, tupleid,
 									scan->xs_snapshot, slot,
 									&scan->xs_heap_continue, &all_dead);
 
@@ -669,16 +802,30 @@ index_getnext_slot(IndexScanDesc scan, ScanDirection direction, TupleTableSlot *
 	{
 		if (!scan->xs_heap_continue)
 		{
-			ItemPointer tid;
+			if (scan->xs_want_rowid)
+			{
+				NullableDatum rowid;
+				/* Time to fetch the next TID from the index */
+				rowid = index_getnext_rowid(scan, direction);
 
-			/* Time to fetch the next TID from the index */
-			tid = index_getnext_tid(scan, direction);
+				/* If we're out of index entries, we're done */
+				if (rowid.isnull)
+					break;
 
-			/* If we're out of index entries, we're done */
-			if (tid == NULL)
-				break;
+				/* Assert(RowidEquals(rowid, &scan->xs_rowid)); */
+			}
+			else
+			{
+				ItemPointer tid;
+				/* Time to fetch the next TID from the index */
+				tid = index_getnext_tid(scan, direction);
 
-			Assert(ItemPointerEquals(tid, &scan->xs_heaptid));
+				/* If we're out of index entries, we're done */
+				if (tid == NULL)
+					break;
+
+				Assert(ItemPointerEquals(tid, &scan->xs_heaptid));
+			}
 		}
 
 		/*
@@ -686,7 +833,8 @@ index_getnext_slot(IndexScanDesc scan, ScanDirection direction, TupleTableSlot *
 		 * If we don't find anything, loop around and grab the next TID from
 		 * the index.
 		 */
-		Assert(ItemPointerIsValid(&scan->xs_heaptid));
+		if (!scan->xs_want_rowid)
+			Assert(ItemPointerIsValid(&scan->xs_heaptid));
 		if (index_fetch_heap(scan, slot))
 			return true;
 	}

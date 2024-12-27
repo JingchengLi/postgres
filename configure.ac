@@ -579,6 +579,10 @@ if test "$GCC" = yes -a "$ICC" = no; then
   if test -n "$NOT_THE_CFLAGS"; then
     CFLAGS="$CFLAGS -Wno-cast-function-type-strict"
   fi
+  if test x"$host_cpu" == x"aarch64"; then
+    PGAC_PROG_CC_CFLAGS_OPT([-moutline-atomics])
+    PGAC_PROG_CXX_CFLAGS_OPT([-moutline-atomics])
+  fi
 elif test "$ICC" = yes; then
   # Intel's compiler has a bug/misoptimization in checking for
   # division by NAN (NaN == 0), -mp1 fixes it, so add it to the CFLAGS.
@@ -1804,7 +1808,6 @@ AC_CHECK_FUNCS(m4_normalize([
 	memset_s
 	posix_fallocate
 	ppoll
-	pthread_is_threaded_np
 	setproctitle
 	setproctitle_fast
 	strchrnul
@@ -2413,6 +2416,10 @@ AC_DEFINE_UNQUOTED(PG_VERSION_STR,
 $AWK '{printf "%d%04d", $1, $2}'`"]
 AC_DEFINE_UNQUOTED(PG_VERSION_NUM, $PG_VERSION_NUM, [PostgreSQL version as a number])
 AC_SUBST(PG_VERSION_NUM)
+
+# Needed to check postgresql patches git tag during orioledb extension build
+[ORIOLEDB_PATCHSET_VERSION=`git describe --tags | cut -d'_' -f2`]
+AC_SUBST(ORIOLEDB_PATCHSET_VERSION)
 
 # If we are inserting PG_SYSROOT into CPPFLAGS, do so symbolically not
 # literally, so that it's possible to override it at build time using

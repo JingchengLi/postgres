@@ -41,6 +41,10 @@ extern char *makeObjectName(const char *name1, const char *name2,
 extern char *ChooseRelationName(const char *name1, const char *name2,
 								const char *label, Oid namespaceid,
 								bool isconstraint);
+extern List *ChooseIndexColumnNames(List *indexElems);
+extern char *ChooseIndexName(const char *tabname, Oid namespaceId,
+							 List *colnames, List *exclusionOpNames,
+							 bool primary, bool isconstraint);
 extern bool CheckIndexCompatible(Oid oldId,
 								 const char *accessMethodName,
 								 List *attributeList,
@@ -157,5 +161,8 @@ extern TypeName *defGetTypeName(DefElem *def);
 extern int	defGetTypeLength(DefElem *def);
 extern List *defGetStringList(DefElem *def);
 extern void errorConflictingDefElem(DefElem *defel, ParseState *pstate) pg_attribute_noreturn();
+
+typedef Oid (*GetDefaultOpClass_hook_type)(Oid type_id, Oid am_id);
+extern PGDLLIMPORT GetDefaultOpClass_hook_type GetDefaultOpClass_hook;
 
 #endif							/* DEFREM_H */

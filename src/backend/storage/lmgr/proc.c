@@ -829,6 +829,7 @@ ProcKill(int code, Datum arg)
 	 * facility by releasing our PGPROC ...
 	 */
 	LWLockReleaseAll();
+	CustomErrorCleanup();
 
 	/* Cancel any pending condition variable sleep, too */
 	ConditionVariableCancelSleep();
@@ -940,6 +941,7 @@ AuxiliaryProcKill(int code, Datum arg)
 
 	/* Release any LW locks I am holding (see notes above) */
 	LWLockReleaseAll();
+	CustomErrorCleanup();
 
 	/* Cancel any pending condition variable sleep, too */
 	ConditionVariableCancelSleep();
@@ -1190,7 +1192,7 @@ ProcSleep(LOCALLOCK *locallock, LockMethod lockMethodTable)
 	 * If InHotStandby we set lock waits slightly later for clarity with other
 	 * code.
 	 */
-	if (!InHotStandby)
+	if (!InHotStandby && !InRecovery)
 	{
 		if (LockTimeout > 0)
 		{
@@ -1550,7 +1552,7 @@ ProcSleep(LOCALLOCK *locallock, LockMethod lockMethodTable)
 	 * already caused QueryCancelPending to become set, we want the cancel to
 	 * be reported as a lock timeout, not a user cancel.
 	 */
-	if (!InHotStandby)
+	if (!InHotStandby && !InRecovery)
 	{
 		if (LockTimeout > 0)
 		{

@@ -164,7 +164,7 @@ dibuildempty(Relation index)
  */
 static bool
 diinsert(Relation index, Datum *values, bool *isnull,
-		 ItemPointer ht_ctid, Relation heapRel,
+		 Datum tupleid, Relation heapRel,
 		 IndexUniqueCheck checkUnique,
 		 bool indexUnchanged,
 		 IndexInfo *indexInfo)
@@ -302,7 +302,8 @@ dihandler(PG_FUNCTION_ARGS)
 
 	amroutine->ambuild = dibuild;
 	amroutine->ambuildempty = dibuildempty;
-	amroutine->aminsert = diinsert;
+	amroutine->aminsert = NULL;
+	amroutine->aminsertextended = diinsert;
 	amroutine->ambulkdelete = dibulkdelete;
 	amroutine->amvacuumcleanup = divacuumcleanup;
 	amroutine->amcanreturn = NULL;

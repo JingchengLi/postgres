@@ -153,6 +153,7 @@ cdata.set('PG_VERSION_NUM', pg_version_num)
 # PG_VERSION_STR is built later, it depends on compiler test results
 cdata.set_quoted('CONFIGURE_ARGS', '')
 
+orioledb_patchset_version = '22'
 
 
 ###############################################################
@@ -2539,7 +2540,6 @@ func_checks = [
   ['posix_fallocate'],
   ['ppoll'],
   ['pthread_barrier_wait', {'dependencies': [thread_dep]}],
-  ['pthread_is_threaded_np', {'dependencies': [thread_dep]}],
   ['sem_init', {'dependencies': [rt_dep, thread_dep], 'skip': sema_kind != 'unnamed_posix', 'define': false}],
   ['setproctitle', {'dependencies': [util_dep]}],
   ['setproctitle_fast'],

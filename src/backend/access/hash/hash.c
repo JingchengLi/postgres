@@ -82,7 +82,8 @@ hashhandler(PG_FUNCTION_ARGS)
 
 	amroutine->ambuild = hashbuild;
 	amroutine->ambuildempty = hashbuildempty;
-	amroutine->aminsert = hashinsert;
+	amroutine->aminsert = NULL;
+	amroutine->aminsertextended = hashinsert;
 	amroutine->ambulkdelete = hashbulkdelete;
 	amroutine->amvacuumcleanup = hashvacuumcleanup;
 	amroutine->amcanreturn = NULL;
@@ -247,7 +248,7 @@ hashbuildCallback(Relation index,
  */
 bool
 hashinsert(Relation rel, Datum *values, bool *isnull,
-		   ItemPointer ht_ctid, Relation heapRel,
+		   Datum tupleid, Relation heapRel,
 		   IndexUniqueCheck checkUnique,
 		   bool indexUnchanged,
 		   IndexInfo *indexInfo)
@@ -255,6 +256,7 @@ hashinsert(Relation rel, Datum *values, bool *isnull,
 	Datum		index_values[1];
 	bool		index_isnull[1];
 	IndexTuple	itup;
+	ItemPointer ht_ctid = DatumGetItemPointer(tupleid);
 
 	/* convert data to a hash key; on failure, do not insert anything */
 	if (!_hash_convert_tuple(rel,

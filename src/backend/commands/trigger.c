@@ -83,7 +83,7 @@ static void SetTriggerFlags(TriggerDesc *trigdesc, Trigger *trigger);
 static bool GetTupleForTrigger(EState *estate,
 							   EPQState *epqstate,
 							   ResultRelInfo *relinfo,
-							   ItemPointer tid,
+							   Datum tupleid,
 							   LockTupleMode lockmode,
 							   TupleTableSlot *oldslot,
 							   TupleTableSlot **epqslot,
@@ -2688,7 +2688,7 @@ ExecASDeleteTriggers(EState *estate, ResultRelInfo *relinfo,
 bool
 ExecBRDeleteTriggers(EState *estate, EPQState *epqstate,
 					 ResultRelInfo *relinfo,
-					 ItemPointer tupleid,
+					 Datum tupleid,
 					 HeapTuple fdw_trigtuple,
 					 TupleTableSlot **epqslot,
 					 TM_Result *tmresult,
@@ -2702,7 +2702,7 @@ ExecBRDeleteTriggers(EState *estate, EPQState *epqstate,
 	bool		should_free = false;
 	int			i;
 
-	Assert(HeapTupleIsValid(fdw_trigtuple) ^ ItemPointerIsValid(tupleid));
+	Assert(HeapTupleIsValid(fdw_trigtuple) ^ (DatumGetPointer(tupleid) != NULL));
 	if (fdw_trigtuple == NULL)
 	{
 		TupleTableSlot *epqslot_candidate = NULL;
@@ -2779,8 +2779,8 @@ ExecBRDeleteTriggers(EState *estate, EPQState *epqstate,
 void
 ExecARDeleteTriggers(EState *estate,
 					 ResultRelInfo *relinfo,
-					 ItemPointer tupleid,
 					 HeapTuple fdw_trigtuple,
+					 TupleTableSlot *slot,
 					 TransitionCaptureState *transition_capture,
 					 bool is_crosspart_update)
 {
@@ -2789,20 +2789,11 @@ ExecARDeleteTriggers(EState *estate,
 	if ((trigdesc && trigdesc->trig_delete_after_row) ||
 		(transition_capture && transition_capture->tcs_delete_old_table))
 	{
-		TupleTableSlot *slot = ExecGetTriggerOldSlot(estate, relinfo);
-
-		Assert(HeapTupleIsValid(fdw_trigtuple) ^ ItemPointerIsValid(tupleid));
-		if (fdw_trigtuple == NULL)
-			GetTupleForTrigger(estate,
-							   NULL,
-							   relinfo,
-							   tupleid,
-							   LockTupleExclusive,
-							   slot,
-							   NULL,
-							   NULL,
-							   NULL);
-		else
+		/*
+		 * Put the FDW old tuple to the slot.  Otherwise, caller is expected
+		 * to have old tuple alredy fetched to the slot.
+		 */
+		if (fdw_trigtuple != NULL)
 			ExecForceStoreHeapTuple(fdw_trigtuple, slot, false);
 
 		AfterTriggerSaveEvent(estate, relinfo, NULL, NULL,
@@ -2939,7 +2930,7 @@ ExecASUpdateTriggers(EState *estate, ResultRelInfo *relinfo,
 bool
 ExecBRUpdateTriggers(EState *estate, EPQState *epqstate,
 					 ResultRelInfo *relinfo,
-					 ItemPointer tupleid,
+					 Datum tupleid,
 					 HeapTuple fdw_trigtuple,
 					 TupleTableSlot *newslot,
 					 TM_Result *tmresult,
@@ -2959,7 +2950,7 @@ ExecBRUpdateTriggers(EState *estate, EPQState *epqstate,
 	/* Determine lock mode to use */
 	lockmode = ExecUpdateLockMode(estate, relinfo);
 
-	Assert(HeapTupleIsValid(fdw_trigtuple) ^ ItemPointerIsValid(tupleid));
+	Assert(HeapTupleIsValid(fdw_trigtuple) ^ (DatumGetPointer(tupleid) != NULL));
 	if (fdw_trigtuple == NULL)
 	{
 		TupleTableSlot *epqslot_candidate = NULL;
@@ -3093,18 +3084,17 @@ ExecBRUpdateTriggers(EState *estate, EPQState *epqstate,
  * Note: 'src_partinfo' and 'dst_partinfo', when non-NULL, refer to the source
  * and destination partitions, respectively, of a cross-partition update of
  * the root partitioned table mentioned in the query, given by 'relinfo'.
- * 'tupleid' in that case refers to the ctid of the "old" tuple in the source
- * partition, and 'newslot' contains the "new" tuple in the destination
- * partition.  This interface allows to support the requirements of
- * ExecCrossPartitionUpdateForeignKey(); is_crosspart_update must be true in
- * that case.
+ * 'oldslot' contains the "old" tuple in the source partition, and 'newslot'
+ * contains the "new" tuple in the destination partition.  This interface
+ * allows to support the requirements of ExecCrossPartitionUpdateForeignKey();
+ * is_crosspart_update must be true in that case.
  */
 void
 ExecARUpdateTriggers(EState *estate, ResultRelInfo *relinfo,
 					 ResultRelInfo *src_partinfo,
 					 ResultRelInfo *dst_partinfo,
-					 ItemPointer tupleid,
 					 HeapTuple fdw_trigtuple,
+					 TupleTableSlot *oldslot,
 					 TupleTableSlot *newslot,
 					 List *recheckIndexes,
 					 TransitionCaptureState *transition_capture,
@@ -3123,29 +3113,14 @@ ExecARUpdateTriggers(EState *estate, ResultRelInfo *relinfo,
 		 * separately for DELETE and INSERT to capture transition table rows.
 		 * In such case, either old tuple or new tuple can be NULL.
 		 */
-		TupleTableSlot *oldslot;
-		ResultRelInfo *tupsrc;
-
 		Assert((src_partinfo != NULL && dst_partinfo != NULL) ||
 			   !is_crosspart_update);
 
-		tupsrc = src_partinfo ? src_partinfo : relinfo;
-		oldslot = ExecGetTriggerOldSlot(estate, tupsrc);
-
-		if (fdw_trigtuple == NULL && ItemPointerIsValid(tupleid))
-			GetTupleForTrigger(estate,
-							   NULL,
-							   tupsrc,
-							   tupleid,
-							   LockTupleExclusive,
-							   oldslot,
-							   NULL,
-							   NULL,
-							   NULL);
-		else if (fdw_trigtuple != NULL)
+		if (fdw_trigtuple != NULL)
+		{
+			Assert(oldslot);
 			ExecForceStoreHeapTuple(fdw_trigtuple, oldslot, false);
-		else
-			ExecClearTuple(oldslot);
+		}
 
 		AfterTriggerSaveEvent(estate, relinfo,
 							  src_partinfo, dst_partinfo,
@@ -3292,7 +3267,7 @@ static bool
 GetTupleForTrigger(EState *estate,
 				   EPQState *epqstate,
 				   ResultRelInfo *relinfo,
-				   ItemPointer tid,
+				   Datum tupleid,
 				   LockTupleMode lockmode,
 				   TupleTableSlot *oldslot,
 				   TupleTableSlot **epqslot,
@@ -3317,7 +3292,9 @@ GetTupleForTrigger(EState *estate,
 		 */
 		if (!IsolationUsesXactSnapshot())
 			lockflags |= TUPLE_LOCK_FLAG_FIND_LAST_VERSION;
-		test = table_tuple_lock(relation, tid, estate->es_snapshot, oldslot,
+
+		test = table_tuple_lock(relation, tupleid,
+								estate->es_snapshot, oldslot,
 								estate->es_output_cid,
 								lockmode, LockWaitBlock,
 								lockflags,
@@ -3413,8 +3390,8 @@ GetTupleForTrigger(EState *estate,
 		 * We expect the tuple to be present, thus very simple error handling
 		 * suffices.
 		 */
-		if (!table_tuple_fetch_row_version(relation, tid, SnapshotAny,
-										   oldslot))
+		if (!table_tuple_fetch_row_version(relation, tupleid,
+										   SnapshotAny, oldslot))
 			elog(ERROR, "failed to fetch tuple for trigger");
 	}
 
@@ -3620,18 +3597,22 @@ typedef SetConstraintStateData *SetConstraintState;
  * cycles.  So we need only ensure that ats_firing_id is zero when attaching
  * a new event to an existing AfterTriggerSharedData record.
  */
-typedef uint32 TriggerFlags;
+typedef uint64 TriggerFlags;
 
-#define AFTER_TRIGGER_OFFSET			0x07FFFFFF	/* must be low-order bits */
-#define AFTER_TRIGGER_DONE				0x80000000
-#define AFTER_TRIGGER_IN_PROGRESS		0x40000000
+#define AFTER_TRIGGER_SIZE				UINT64CONST(0xFFFF000000000)	/* must be low-order bits */
+#define AFTER_TRIGGER_SIZE_SHIFT		(36)
+#define AFTER_TRIGGER_OFFSET			UINT64CONST(0x000000FFFFFFF)	/* must be low-order bits */
+#define AFTER_TRIGGER_DONE				UINT64CONST(0x0000800000000)
+#define AFTER_TRIGGER_IN_PROGRESS		UINT64CONST(0x0000400000000)
 /* bits describing the size and tuple sources of this event */
-#define AFTER_TRIGGER_FDW_REUSE			0x00000000
-#define AFTER_TRIGGER_FDW_FETCH			0x20000000
-#define AFTER_TRIGGER_1CTID				0x10000000
-#define AFTER_TRIGGER_2CTID				0x30000000
-#define AFTER_TRIGGER_CP_UPDATE			0x08000000
-#define AFTER_TRIGGER_TUP_BITS			0x38000000
+#define AFTER_TRIGGER_FDW_REUSE			UINT64CONST(0x0000000000000)
+#define AFTER_TRIGGER_FDW_FETCH			UINT64CONST(0x0000200000000)
+#define AFTER_TRIGGER_1CTID				UINT64CONST(0x0000100000000)
+#define AFTER_TRIGGER_ROWID1			UINT64CONST(0x0000010000000)
+#define AFTER_TRIGGER_2CTID				UINT64CONST(0x0000300000000)
+#define AFTER_TRIGGER_ROWID2			UINT64CONST(0x0000020000000)
+#define AFTER_TRIGGER_CP_UPDATE			UINT64CONST(0x0000080000000)
+#define AFTER_TRIGGER_TUP_BITS			UINT64CONST(0x0000380000000)
 typedef struct AfterTriggerSharedData *AfterTriggerShared;
 
 typedef struct AfterTriggerSharedData
@@ -3683,6 +3664,9 @@ typedef struct AfterTriggerEventDataZeroCtids
 }			AfterTriggerEventDataZeroCtids;
 
 #define SizeofTriggerEvent(evt) \
+	(((evt)->ate_flags & AFTER_TRIGGER_SIZE) >> AFTER_TRIGGER_SIZE_SHIFT)
+
+#define BasicSizeofTriggerEvent(evt) \
 	(((evt)->ate_flags & AFTER_TRIGGER_TUP_BITS) == AFTER_TRIGGER_CP_UPDATE ? \
 	 sizeof(AfterTriggerEventData) : \
 	 (((evt)->ate_flags & AFTER_TRIGGER_TUP_BITS) == AFTER_TRIGGER_2CTID ? \
@@ -4035,13 +4019,33 @@ afterTriggerCopyBitmap(Bitmapset *src)
  */
 static void
 afterTriggerAddEvent(AfterTriggerEventList *events,
-					 AfterTriggerEvent event, AfterTriggerShared evtshared)
+					 AfterTriggerEvent event, AfterTriggerShared evtshared,
+					 bytea *rowid1, bytea *rowid2)
 {
-	Size		eventsize = SizeofTriggerEvent(event);
-	Size		needed = eventsize + sizeof(AfterTriggerSharedData);
+	Size		basiceventsize = MAXALIGN(BasicSizeofTriggerEvent(event));
+	Size		eventsize;
+	Size		needed;
 	AfterTriggerEventChunk *chunk;
 	AfterTriggerShared newshared;
 	AfterTriggerEvent newevent;
+
+	if (SizeofTriggerEvent(event) == 0)
+	{
+		eventsize = basiceventsize;
+		if (event->ate_flags & AFTER_TRIGGER_ROWID1)
+			eventsize += MAXALIGN(VARSIZE(rowid1));
+
+		if (event->ate_flags & AFTER_TRIGGER_ROWID2)
+			eventsize += MAXALIGN(VARSIZE(rowid2));
+
+		event->ate_flags |= eventsize << AFTER_TRIGGER_SIZE_SHIFT;
+	}
+	else
+	{
+		eventsize = SizeofTriggerEvent(event);
+	}
+
+	needed = eventsize + sizeof(AfterTriggerSharedData);
 
 	/*
 	 * If empty list or not enough room in the tail chunk, make a new chunk.
@@ -4075,7 +4079,7 @@ afterTriggerAddEvent(AfterTriggerEventList *events,
 		 * sizes used should be MAXALIGN multiples, to ensure that the shared
 		 * records will be aligned safely.
 		 */
-#define MIN_CHUNK_SIZE 1024
+#define MIN_CHUNK_SIZE (1024*4)
 #define MAX_CHUNK_SIZE (1024*1024)
 
 #if MAX_CHUNK_SIZE > (AFTER_TRIGGER_OFFSET+1)
@@ -4094,6 +4098,7 @@ afterTriggerAddEvent(AfterTriggerEventList *events,
 				chunksize *= 2; /* okay, double it */
 			else
 				chunksize /= 2; /* too many shared records */
+			chunksize = Max(chunksize, MIN_CHUNK_SIZE);
 			chunksize = Min(chunksize, MAX_CHUNK_SIZE);
 		}
 		chunk = MemoryContextAlloc(afterTriggers.event_cxt, chunksize);
@@ -4134,7 +4139,26 @@ afterTriggerAddEvent(AfterTriggerEventList *events,
 
 	/* Insert the data */
 	newevent = (AfterTriggerEvent) chunk->freeptr;
-	memcpy(newevent, event, eventsize);
+	if (!rowid1 && !rowid2)
+	{
+		memcpy(newevent, event, eventsize);
+	}
+	else
+	{
+		Pointer ptr = chunk->freeptr;
+
+		memcpy(newevent, event, basiceventsize);
+		ptr += basiceventsize;
+
+		if (event->ate_flags & AFTER_TRIGGER_ROWID1)
+		{
+			memcpy(ptr, rowid1, MAXALIGN(VARSIZE(rowid1)));
+			ptr += MAXALIGN(VARSIZE(rowid1));
+		}
+
+		if (event->ate_flags & AFTER_TRIGGER_ROWID2)
+			memcpy(ptr, rowid2, MAXALIGN(VARSIZE(rowid2)));
+	}
 	/* ... and link the new event to its shared record */
 	newevent->ate_flags &= ~AFTER_TRIGGER_OFFSET;
 	newevent->ate_flags |= (char *) newshared - (char *) newevent;
@@ -4294,6 +4318,7 @@ AfterTriggerExecute(EState *estate,
 	int			tgindx;
 	bool		should_free_trig = false;
 	bool		should_free_new = false;
+	Pointer		ptr;
 
 	/*
 	 * Locate trigger in trigdesc.  It might not be present, and in fact the
@@ -4329,15 +4354,17 @@ AfterTriggerExecute(EState *estate,
 			{
 				Tuplestorestate *fdw_tuplestore = GetCurrentFDWTuplestore();
 
-				if (!tuplestore_gettupleslot(fdw_tuplestore, true, false,
-											 trig_tuple_slot1))
+				if (!tuplestore_force_gettupleslot(fdw_tuplestore, true, false,
+												   trig_tuple_slot1))
 					elog(ERROR, "failed to fetch tuple1 for AFTER trigger");
 
 				if ((evtshared->ats_event & TRIGGER_EVENT_OPMASK) ==
 					TRIGGER_EVENT_UPDATE &&
-					!tuplestore_gettupleslot(fdw_tuplestore, true, false,
-											 trig_tuple_slot2))
+					!tuplestore_force_gettupleslot(fdw_tuplestore, true, false,
+												   trig_tuple_slot2))
 					elog(ERROR, "failed to fetch tuple2 for AFTER trigger");
+				trig_tuple_slot1->tts_tid = event->ate_ctid1;
+				trig_tuple_slot2->tts_tid = event->ate_ctid2;
 			}
 			/* fall through */
 		case AFTER_TRIGGER_FDW_REUSE:
@@ -4369,13 +4396,26 @@ AfterTriggerExecute(EState *estate,
 			break;
 
 		default:
-			if (ItemPointerIsValid(&(event->ate_ctid1)))
+			ptr = (Pointer) event + MAXALIGN(BasicSizeofTriggerEvent(event));
+			if (ItemPointerIsValid(&(event->ate_ctid1)) ||
+				(event->ate_flags & AFTER_TRIGGER_ROWID1))
 			{
+				Datum		tupleid;
+
 				TupleTableSlot *src_slot = ExecGetTriggerOldSlot(estate,
 																 src_relInfo);
 
-				if (!table_tuple_fetch_row_version(src_rel,
-												   &(event->ate_ctid1),
+				if (event->ate_flags & AFTER_TRIGGER_ROWID1)
+				{
+					tupleid = PointerGetDatum(ptr);
+					ptr += MAXALIGN(VARSIZE(ptr));
+				}
+				else
+				{
+					tupleid = PointerGetDatum(&(event->ate_ctid1));
+				}
+
+				if (!table_tuple_fetch_row_version(src_rel, tupleid,
 												   SnapshotAny,
 												   src_slot))
 					elog(ERROR, "failed to fetch tuple1 for AFTER trigger");
@@ -4411,13 +4451,23 @@ AfterTriggerExecute(EState *estate,
 			/* don't touch ctid2 if not there */
 			if (((event->ate_flags & AFTER_TRIGGER_TUP_BITS) == AFTER_TRIGGER_2CTID ||
 				 (event->ate_flags & AFTER_TRIGGER_CP_UPDATE)) &&
-				ItemPointerIsValid(&(event->ate_ctid2)))
+				(ItemPointerIsValid(&(event->ate_ctid2)) ||
+				 (event->ate_flags & AFTER_TRIGGER_ROWID2)))
 			{
+				Datum		tupleid;
+
 				TupleTableSlot *dst_slot = ExecGetTriggerNewSlot(estate,
 																 dst_relInfo);
 
-				if (!table_tuple_fetch_row_version(dst_rel,
-												   &(event->ate_ctid2),
+				if (event->ate_flags & AFTER_TRIGGER_ROWID2)
+				{
+					tupleid = PointerGetDatum(ptr);
+				}
+				else
+				{
+					tupleid = PointerGetDatum(&(event->ate_ctid2));
+				}
+				if (!table_tuple_fetch_row_version(dst_rel, tupleid,
 												   SnapshotAny,
 												   dst_slot))
 					elog(ERROR, "failed to fetch tuple2 for AFTER trigger");
@@ -4591,7 +4641,7 @@ afterTriggerMarkEvents(AfterTriggerEventList *events,
 		{
 			deferred_found = true;
 			/* add it to move_list */
-			afterTriggerAddEvent(move_list, event, evtshared);
+			afterTriggerAddEvent(move_list, event, evtshared, NULL, NULL);
 			/* mark original copy "done" so we don't do it again */
 			event->ate_flags |= AFTER_TRIGGER_DONE;
 		}
@@ -4695,6 +4745,7 @@ afterTriggerInvokeEvents(AfterTriggerEventList *events,
 					/* caution: trigdesc could be NULL here */
 					finfo = rInfo->ri_TrigFunctions;
 					instr = rInfo->ri_TrigInstrument;
+
 					if (slot1 != NULL)
 					{
 						ExecDropSingleTupleTableSlot(slot1);
@@ -6084,6 +6135,8 @@ AfterTriggerSaveEvent(EState *estate, ResultRelInfo *relinfo,
 	int			tgtype_level;
 	int			i;
 	Tuplestorestate *fdw_tuplestore = NULL;
+	bytea	   *rowId1 = NULL;
+	bytea	   *rowId2 = NULL;
 
 	/*
 	 * Check state.  We use a normal test not Assert because it is possible to
@@ -6177,6 +6230,21 @@ AfterTriggerSaveEvent(EState *estate, ResultRelInfo *relinfo,
 	 * if so.  This preserves the behavior that statement-level triggers fire
 	 * just once per statement and fire after row-level triggers.
 	 */
+
+	/* Determine flags */
+	if (!(relkind == RELKIND_FOREIGN_TABLE && row_trigger))
+	{
+		if (row_trigger && event == TRIGGER_EVENT_UPDATE)
+		{
+			if (relkind == RELKIND_PARTITIONED_TABLE)
+				new_event.ate_flags = AFTER_TRIGGER_CP_UPDATE;
+			else
+				new_event.ate_flags = AFTER_TRIGGER_2CTID;
+		}
+		else
+			new_event.ate_flags = AFTER_TRIGGER_1CTID;
+	}
+
 	switch (event)
 	{
 		case TRIGGER_EVENT_INSERT:
@@ -6187,6 +6255,13 @@ AfterTriggerSaveEvent(EState *estate, ResultRelInfo *relinfo,
 				Assert(newslot != NULL);
 				ItemPointerCopy(&(newslot->tts_tid), &(new_event.ate_ctid1));
 				ItemPointerSetInvalid(&(new_event.ate_ctid2));
+				if (table_get_row_ref_type(rel) == ROW_REF_ROWID)
+				{
+					bool	isnull;
+					rowId1 = DatumGetByteaP(slot_getsysattr(newslot, RowIdAttributeNumber, &isnull));
+					new_event.ate_flags |= AFTER_TRIGGER_ROWID1;
+					Assert(!isnull);
+				}
 			}
 			else
 			{
@@ -6206,6 +6281,13 @@ AfterTriggerSaveEvent(EState *estate, ResultRelInfo *relinfo,
 				Assert(newslot == NULL);
 				ItemPointerCopy(&(oldslot->tts_tid), &(new_event.ate_ctid1));
 				ItemPointerSetInvalid(&(new_event.ate_ctid2));
+				if (table_get_row_ref_type(rel) == ROW_REF_ROWID)
+				{
+					bool	isnull;
+					rowId1 = DatumGetByteaP(slot_getsysattr(oldslot, RowIdAttributeNumber, &isnull));
+					new_event.ate_flags |= AFTER_TRIGGER_ROWID1;
+					Assert(!isnull);
+				}
 			}
 			else
 			{
@@ -6221,10 +6303,54 @@ AfterTriggerSaveEvent(EState *estate, ResultRelInfo *relinfo,
 			tgtype_event = TRIGGER_TYPE_UPDATE;
 			if (row_trigger)
 			{
+				bool		src_rowid = false,
+							dst_rowid = false;
 				Assert(oldslot != NULL);
 				Assert(newslot != NULL);
 				ItemPointerCopy(&(oldslot->tts_tid), &(new_event.ate_ctid1));
 				ItemPointerCopy(&(newslot->tts_tid), &(new_event.ate_ctid2));
+				if (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
+				{
+					Relation src_rel = src_partinfo->ri_RelationDesc;
+					Relation dst_rel = dst_partinfo->ri_RelationDesc;
+
+					src_rowid = table_get_row_ref_type(src_rel) ==
+								ROW_REF_ROWID;
+					dst_rowid = table_get_row_ref_type(dst_rel) ==
+								ROW_REF_ROWID;
+				}
+				else
+				{
+					if (table_get_row_ref_type(rel) == ROW_REF_ROWID)
+					{
+						src_rowid = true;
+						dst_rowid = true;
+					}
+				}
+
+				if (src_rowid)
+				{
+					Datum	val;
+					bool	isnull;
+					val = slot_getsysattr(oldslot,
+										  RowIdAttributeNumber,
+										  &isnull);
+					rowId1 = DatumGetByteaP(val);
+					Assert(!isnull);
+					new_event.ate_flags |= AFTER_TRIGGER_ROWID1;
+				}
+
+				if (dst_rowid)
+				{
+					Datum	val;
+					bool	isnull;
+					val = slot_getsysattr(newslot,
+										  RowIdAttributeNumber,
+										  &isnull);
+					rowId2 = DatumGetByteaP(val);
+					Assert(!isnull);
+					new_event.ate_flags |= AFTER_TRIGGER_ROWID2;
+				}
 
 				/*
 				 * Also remember the OIDs of partitions to fetch these tuples
@@ -6260,20 +6386,6 @@ AfterTriggerSaveEvent(EState *estate, ResultRelInfo *relinfo,
 			elog(ERROR, "invalid after-trigger event code: %d", event);
 			tgtype_event = 0;	/* keep compiler quiet */
 			break;
-	}
-
-	/* Determine flags */
-	if (!(relkind == RELKIND_FOREIGN_TABLE && row_trigger))
-	{
-		if (row_trigger && event == TRIGGER_EVENT_UPDATE)
-		{
-			if (relkind == RELKIND_PARTITIONED_TABLE)
-				new_event.ate_flags = AFTER_TRIGGER_CP_UPDATE;
-			else
-				new_event.ate_flags = AFTER_TRIGGER_2CTID;
-		}
-		else
-			new_event.ate_flags = AFTER_TRIGGER_1CTID;
 	}
 
 	/* else, we'll initialize ate_flags for each trigger */
@@ -6441,7 +6553,7 @@ AfterTriggerSaveEvent(EState *estate, ResultRelInfo *relinfo,
 		new_shared.ats_modifiedcols = afterTriggerCopyBitmap(modifiedCols);
 
 		afterTriggerAddEvent(&afterTriggers.query_stack[afterTriggers.query_depth].events,
-							 &new_event, &new_shared);
+							 &new_event, &new_shared, rowId1, rowId2);
 	}
 
 	/*

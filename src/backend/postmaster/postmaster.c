@@ -85,10 +85,6 @@
 #include <systemd/sd-daemon.h>
 #endif
 
-#ifdef HAVE_PTHREAD_IS_THREADED_NP
-#include <pthread.h>
-#endif
-
 #include "access/transam.h"
 #include "access/xlog.h"
 #include "access/xlogrecovery.h"
@@ -145,7 +141,8 @@
 #define BACKEND_TYPE_AUTOVAC	0x0002	/* autovacuum worker process */
 #define BACKEND_TYPE_WALSND		0x0004	/* walsender process */
 #define BACKEND_TYPE_BGWORKER	0x0008	/* bgworker process */
-#define BACKEND_TYPE_ALL		0x000F	/* OR of all the above */
+#define BACKEND_TYPE_SYSTEM_BGWORKER 0x0010	/* system bgworker process */
+#define BACKEND_TYPE_ALL		0x001F	/* OR of all the above */
 
 /*
  * List of active backends (or child processes anyway; we don't actually
@@ -451,7 +448,7 @@ static void InitPostmasterDeathWatchHandle(void);
  * even during recovery.
  */
 #define PgArchStartupAllowed()	\
-	(((XLogArchivingActive() && pmState == PM_RUN) ||			\
+	(((XLogArchivingActive() && (pmState == PM_RUN || pmState == PM_SHUTDOWN)) || \
 	  (XLogArchivingAlways() &&									  \
 	   (pmState == PM_RECOVERY || pmState == PM_HOT_STANDBY))) && \
 	 PgArchCanRestart())
@@ -578,6 +575,12 @@ int			postmaster_alive_fds[2] = {-1, -1};
 /* Process handle of postmaster used for the same purpose on Windows */
 HANDLE		PostmasterHandle;
 #endif
+
+bool
+IsFatalError(void)
+{
+	return FatalError;
+}
 
 /*
  * Postmaster main entry point
@@ -1417,24 +1420,6 @@ PostmasterMain(int argc, char *argv[])
 		 */
 	}
 
-#ifdef HAVE_PTHREAD_IS_THREADED_NP
-
-	/*
-	 * On macOS, libintl replaces setlocale() with a version that calls
-	 * CFLocaleCopyCurrent() when its second argument is "" and every relevant
-	 * environment variable is unset or empty.  CFLocaleCopyCurrent() makes
-	 * the process multithreaded.  The postmaster calls sigprocmask() and
-	 * calls fork() without an immediate exec(), both of which have undefined
-	 * behavior in a multithreaded program.  A multithreaded postmaster is the
-	 * normal case on Windows, which offers neither fork() nor sigprocmask().
-	 */
-	if (pthread_is_threaded_np() != 0)
-		ereport(FATAL,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("postmaster became multithreaded during startup"),
-				 errhint("Set the LC_ALL environment variable to a valid locale.")));
-#endif
-
 	/*
 	 * Remember postmaster startup time
 	 */
@@ -1851,15 +1836,6 @@ ServerLoop(void)
 		/* Get other worker processes running, if needed */
 		if (StartWorkerNeeded || HaveCrashedWorker)
 			maybe_start_bgworkers();
-
-#ifdef HAVE_PTHREAD_IS_THREADED_NP
-
-		/*
-		 * With assertions enabled, check regularly for appearance of
-		 * additional threads.  All builds check at start and exit.
-		 */
-		Assert(pthread_is_threaded_np() == 0);
-#endif
 
 		/*
 		 * Lastly, check to see if it's time to do some things that we don't
@@ -2466,8 +2442,9 @@ processCancelRequest(Port *port, void *pkt)
 /*
  * canAcceptConnections --- check to see if database state allows connections
  * of the specified type.  backend_type can be BACKEND_TYPE_NORMAL,
- * BACKEND_TYPE_AUTOVAC, or BACKEND_TYPE_BGWORKER.  (Note that we don't yet
- * know whether a NORMAL connection might turn into a walsender.)
+ * BACKEND_TYPE_AUTOVAC, BACKEND_TYPE_BGWORKER or BACKEND_TYPE_SYSTEM_BGWORKER.
+ * (Note that we don't yet know whether a NORMAL connection might turn into
+ * a walsender.)
  */
 static CAC_state
 canAcceptConnections(int backend_type)
@@ -2481,7 +2458,8 @@ canAcceptConnections(int backend_type)
 	 * bgworker_should_start_now() decided whether the DB state allows them.
 	 */
 	if (pmState != PM_RUN && pmState != PM_HOT_STANDBY &&
-		backend_type != BACKEND_TYPE_BGWORKER)
+		backend_type != BACKEND_TYPE_BGWORKER &&
+		backend_type != BACKEND_TYPE_SYSTEM_BGWORKER)
 	{
 		if (Shutdown > NoShutdown)
 			return CAC_SHUTDOWN;	/* shutdown is pending */
@@ -3161,6 +3139,13 @@ process_pm_child_exit(void)
 					signal_child(PgArchPID, SIGUSR2);
 
 				/*
+				 * Terminate system background workers since checpoint is
+				 * complete.
+				 */
+				SignalSomeChildren(SIGTERM,
+								   BACKEND_TYPE_SYSTEM_BGWORKER);
+
+				/*
 				 * Waken walsenders for the last time. No regular backends
 				 * should be around anymore.
 				 */
@@ -3561,7 +3546,8 @@ HandleChildCrash(int pid, int exitstatus, const char *procname)
 			 * Background workers were already processed above; ignore them
 			 * here.
 			 */
-			if (bp->bkend_type == BACKEND_TYPE_BGWORKER)
+			if (bp->bkend_type == BACKEND_TYPE_BGWORKER ||
+				bp->bkend_type == BACKEND_TYPE_SYSTEM_BGWORKER)
 				continue;
 
 			if (take_action)
@@ -3740,7 +3726,7 @@ PostmasterStateMachine(void)
 
 		/* Signal all backend children except walsenders */
 		SignalSomeChildren(SIGTERM,
-						   BACKEND_TYPE_ALL - BACKEND_TYPE_WALSND);
+						   BACKEND_TYPE_ALL - BACKEND_TYPE_WALSND - BACKEND_TYPE_SYSTEM_BGWORKER);
 		/* and the autovac launcher too */
 		if (AutoVacPID != 0)
 			signal_child(AutoVacPID, SIGTERM);
@@ -3778,7 +3764,7 @@ PostmasterStateMachine(void)
 		 * and archiver are also disregarded, they will be terminated later
 		 * after writing the checkpoint record.
 		 */
-		if (CountChildren(BACKEND_TYPE_ALL - BACKEND_TYPE_WALSND) == 0 &&
+		if (CountChildren(BACKEND_TYPE_ALL - BACKEND_TYPE_WALSND - BACKEND_TYPE_SYSTEM_BGWORKER) == 0 &&
 			StartupPID == 0 &&
 			WalReceiverPID == 0 &&
 			BgWriterPID == 0 &&
@@ -5045,21 +5031,6 @@ SubPostmasterMain(int argc, char *argv[])
 static void
 ExitPostmaster(int status)
 {
-#ifdef HAVE_PTHREAD_IS_THREADED_NP
-
-	/*
-	 * There is no known cause for a postmaster to become multithreaded after
-	 * startup.  Recheck to account for the possibility of unknown causes.
-	 * This message uses LOG level, because an unclean shutdown at this point
-	 * would usually not look much different from a clean shutdown.
-	 */
-	if (pthread_is_threaded_np() != 0)
-		ereport(LOG,
-				(errcode(ERRCODE_INTERNAL_ERROR),
-				 errmsg_internal("postmaster became multithreaded"),
-				 errdetail("Please report this to <%s>.", PACKAGE_BUGREPORT)));
-#endif
-
 	/* should cleanup shared memory and kill all backends */
 
 	/*
@@ -5788,16 +5759,20 @@ do_start_bgworker(RegisteredBgWorker *rw)
  * specified start_time?
  */
 static bool
-bgworker_should_start_now(BgWorkerStartTime start_time)
+bgworker_should_start_now(BgWorkerStartTime start_time, int flags)
 {
 	switch (pmState)
 	{
 		case PM_NO_CHILDREN:
 		case PM_WAIT_DEAD_END:
 		case PM_SHUTDOWN_2:
+			break;
+
 		case PM_SHUTDOWN:
 		case PM_WAIT_BACKENDS:
 		case PM_STOP_BACKENDS:
+			if (flags & BGWORKER_CLASS_SYSTEM)
+				return true;
 			break;
 
 		case PM_RUN:
@@ -5872,7 +5847,10 @@ assign_backendlist_entry(RegisteredBgWorker *rw)
 
 	bn->cancel_key = MyCancelKey;
 	bn->child_slot = MyPMChildSlot = AssignPostmasterChildSlot();
-	bn->bkend_type = BACKEND_TYPE_BGWORKER;
+	if (rw->rw_worker.bgw_flags & BGWORKER_CLASS_SYSTEM)
+		bn->bkend_type = BACKEND_TYPE_SYSTEM_BGWORKER;
+	else
+		bn->bkend_type = BACKEND_TYPE_BGWORKER;
 	bn->dead_end = false;
 	bn->bgworker_notify = false;
 
@@ -5970,7 +5948,8 @@ maybe_start_bgworkers(void)
 			}
 		}
 
-		if (bgworker_should_start_now(rw->rw_worker.bgw_start_time))
+		if (bgworker_should_start_now(rw->rw_worker.bgw_start_time,
+									  rw->rw_worker.bgw_flags))
 		{
 			/* reset crash time before trying to start worker */
 			rw->rw_crashed_at = 0;

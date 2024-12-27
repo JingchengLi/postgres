@@ -50,6 +50,7 @@ extern PGDLLIMPORT int postmaster_alive_fds[2];
 
 extern PGDLLIMPORT const char *progname;
 
+extern bool IsFatalError(void);
 extern void PostmasterMain(int argc, char *argv[]) pg_attribute_noreturn();
 extern void ClosePostmasterPorts(bool am_syslogger);
 extern void InitProcessGlobals(void);
@@ -57,6 +58,10 @@ extern void InitProcessGlobals(void);
 extern int	MaxLivePostmasterChildren(void);
 
 extern bool PostmasterMarkPIDForWorkerNotify(int);
+
+typedef void (*base_init_startup_hook_type)(void);
+
+extern PGDLLIMPORT base_init_startup_hook_type base_init_startup_hook;
 
 #ifdef EXEC_BACKEND
 extern pid_t postmaster_forkexec(int argc, char *argv[]);
