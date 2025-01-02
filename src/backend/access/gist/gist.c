@@ -85,7 +85,8 @@ gisthandler(PG_FUNCTION_ARGS)
 
 	amroutine->ambuild = gistbuild;
 	amroutine->ambuildempty = gistbuildempty;
-	amroutine->aminsert = gistinsert;
+	amroutine->aminsert = NULL;
+	amroutine->aminsertextended = gistinsert;
 	amroutine->aminsertcleanup = NULL;
 	amroutine->ambulkdelete = gistbulkdelete;
 	amroutine->amvacuumcleanup = gistvacuumcleanup;
@@ -157,7 +158,7 @@ gistbuildempty(Relation index)
  */
 bool
 gistinsert(Relation r, Datum *values, bool *isnull,
-		   ItemPointer ht_ctid, Relation heapRel,
+		   Datum tupleid, Relation heapRel,
 		   IndexUniqueCheck checkUnique,
 		   bool indexUnchanged,
 		   IndexInfo *indexInfo)
@@ -165,6 +166,7 @@ gistinsert(Relation r, Datum *values, bool *isnull,
 	GISTSTATE  *giststate = (GISTSTATE *) indexInfo->ii_AmCache;
 	IndexTuple	itup;
 	MemoryContext oldCxt;
+	ItemPointer ht_ctid = DatumGetItemPointer(tupleid);
 
 	/* Initialize GISTSTATE cache if first call in this statement */
 	if (giststate == NULL)

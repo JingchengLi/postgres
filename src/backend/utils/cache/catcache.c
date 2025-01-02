@@ -38,6 +38,7 @@
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/resowner.h"
+#include "utils/resowner_private.h"
 #include "utils/syscache.h"
 
 
@@ -63,6 +64,10 @@
 
 /* Cache management header --- pointer is NULL until created */
 static CatCacheHeader *CacheHdr = NULL;
+
+SearchCatCacheInternal_hook_type SearchCatCacheInternal_hook = NULL;
+SearchCatCacheList_hook_type SearchCatCacheList_hook = NULL;
+GetCatCacheHashValue_hook_type GetCatCacheHashValue_hook = NULL;
 
 static inline HeapTuple SearchCatCacheInternal(CatCache *cache,
 											   int nkeys,
@@ -137,7 +142,7 @@ static const ResourceOwnerDesc catlistref_resowner_desc =
 };
 
 /* Convenience wrappers over ResourceOwnerRemember/Forget */
-static inline void
+void
 ResourceOwnerRememberCatCacheRef(ResourceOwner owner, HeapTuple tuple)
 {
 	ResourceOwnerRemember(owner, PointerGetDatum(tuple), &catcache_resowner_desc);
@@ -147,7 +152,7 @@ ResourceOwnerForgetCatCacheRef(ResourceOwner owner, HeapTuple tuple)
 {
 	ResourceOwnerForget(owner, PointerGetDatum(tuple), &catcache_resowner_desc);
 }
-static inline void
+void
 ResourceOwnerRememberCatCacheListRef(ResourceOwner owner, CatCList *list)
 {
 	ResourceOwnerRemember(owner, PointerGetDatum(list), &catlistref_resowner_desc);
@@ -1324,6 +1329,14 @@ SearchCatCacheInternal(CatCache *cache,
 	dlist_head *bucket;
 	CatCTup    *ct;
 
+	if (SearchCatCacheInternal_hook)
+	{
+		ct = SearchCatCacheInternal_hook(cache, nkeys, v1, v2, v3, v4);
+
+		if (ct)
+			return &ct->tuple;
+	}
+
 	/* Make sure we're in an xact, even if this ends up being a cache hit */
 	Assert(IsTransactionState());
 
@@ -1616,6 +1629,11 @@ GetCatCacheHashValue(CatCache *cache,
 					 Datum v3,
 					 Datum v4)
 {
+	if (GetCatCacheHashValue_hook)
+	{
+		return GetCatCacheHashValue_hook(cache, cache->cc_nkeys,
+										 v1, v2, v3, v4);
+	}
 	/*
 	 * one-time startup overhead for each cache
 	 */
@@ -1665,6 +1683,14 @@ SearchCatCacheList(CatCache *cache,
 	HeapTuple	ntp;
 	MemoryContext oldcxt;
 	int			i;
+
+	if (SearchCatCacheList_hook)
+	{
+		cl = SearchCatCacheList_hook(cache, nkeys, v1, v2, v3);
+
+		if (cl)
+			return cl;
+	}
 
 	/*
 	 * one-time startup overhead for each cache

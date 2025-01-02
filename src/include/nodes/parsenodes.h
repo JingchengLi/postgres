@@ -1103,6 +1103,7 @@ typedef struct RangeTblEntry
 	Index		perminfoindex pg_node_attr(query_jumble_ignore);
 	/* sampling info, or NULL */
 	struct TableSampleClause *tablesample;
+	RowRefType	reftype;
 
 	/*
 	 * Fields valid for a subquery RTE (else NULL):
@@ -2992,6 +2993,7 @@ typedef struct CreateAmStmt
 	char	   *amname;			/* access method name */
 	List	   *handler_name;	/* handler function name */
 	char		amtype;			/* type of access method */
+	char	   *tableam_name;	/* table AM name */
 } CreateAmStmt;
 
 /* ----------------------

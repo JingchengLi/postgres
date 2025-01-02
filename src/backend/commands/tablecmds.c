@@ -700,6 +700,7 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 	ObjectAddress address;
 	LOCKMODE	parentLockmode;
 	Oid			accessMethodId = InvalidOid;
+	const TableAmRoutine *tableam = NULL;
 
 	/*
 	 * Truncate relname to appropriate length (probably a waste of time, as
@@ -835,6 +836,29 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 	if (!OidIsValid(ownerId))
 		ownerId = GetUserId();
 
+
+	/*
+	 * For relations with table AM and partitioned tables, select access
+	 * method to use: an explicitly indicated one, or (in the case of a
+	 * partitioned table) the parent's, if it has one.
+	 */
+	if (stmt->accessMethod != NULL)
+	{
+		Assert(RELKIND_HAS_TABLE_AM(relkind) || relkind == RELKIND_PARTITIONED_TABLE);
+		accessMethodId = get_table_am_oid(stmt->accessMethod, false);
+	}
+	else if (RELKIND_HAS_TABLE_AM(relkind) || relkind == RELKIND_PARTITIONED_TABLE)
+	{
+		if (stmt->partbound)
+		{
+			Assert(list_length(inheritOids) == 1);
+			accessMethodId = get_rel_relam(linitial_oid(inheritOids));
+		}
+
+		if (RELKIND_HAS_TABLE_AM(relkind) && !OidIsValid(accessMethodId))
+			accessMethodId = get_table_am_oid(default_table_access_method, false);
+	}
+
 	/*
 	 * Parse and validate reloptions, if any.
 	 */
@@ -843,6 +867,12 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 
 	switch (relkind)
 	{
+		case RELKIND_RELATION:
+		case RELKIND_TOASTVALUE:
+		case RELKIND_MATVIEW:
+			tableam = GetTableAmRoutineByAmOid(accessMethodId);
+			(void) tableam_reloptions(tableam, relkind, reloptions, true);
+			break;
 		case RELKIND_VIEW:
 			(void) view_reloptions(reloptions, true);
 			break;
@@ -851,6 +881,7 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 			break;
 		default:
 			(void) heap_reloptions(relkind, reloptions, true);
+			break;
 	}
 
 	if (stmt->ofTypename)
@@ -939,28 +970,6 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 			cookedDefaults = lappend(cookedDefaults, cooked);
 			attr->atthasdef = true;
 		}
-	}
-
-	/*
-	 * For relations with table AM and partitioned tables, select access
-	 * method to use: an explicitly indicated one, or (in the case of a
-	 * partitioned table) the parent's, if it has one.
-	 */
-	if (stmt->accessMethod != NULL)
-	{
-		Assert(RELKIND_HAS_TABLE_AM(relkind) || relkind == RELKIND_PARTITIONED_TABLE);
-		accessMethodId = get_table_am_oid(stmt->accessMethod, false);
-	}
-	else if (RELKIND_HAS_TABLE_AM(relkind) || relkind == RELKIND_PARTITIONED_TABLE)
-	{
-		if (stmt->partbound)
-		{
-			Assert(list_length(inheritOids) == 1);
-			accessMethodId = get_rel_relam(linitial_oid(inheritOids));
-		}
-
-		if (RELKIND_HAS_TABLE_AM(relkind) && !OidIsValid(accessMethodId))
-			accessMethodId = get_table_am_oid(default_table_access_method, false);
 	}
 
 	/*
@@ -6304,8 +6313,10 @@ ATRewriteTable(AlteredTableInfo *tab, Oid OIDNewHeap, LOCKMODE lockmode)
 
 			/* Write the tuple out to the new relation */
 			if (newrel)
+			{
 				table_tuple_insert(newrel, insertslot, mycid,
 								   ti_options, bistate);
+			}
 
 			ResetExprContext(econtext);
 
@@ -14933,7 +14944,8 @@ ATExecSetRelOptions(Relation rel, List *defList, AlterTableType operation,
 		case RELKIND_RELATION:
 		case RELKIND_TOASTVALUE:
 		case RELKIND_MATVIEW:
-			(void) heap_reloptions(rel->rd_rel->relkind, newOptions, true);
+			(void) table_reloptions(rel, rel->rd_rel->relkind,
+									newOptions, true);
 			break;
 		case RELKIND_PARTITIONED_TABLE:
 			(void) partitioned_table_reloptions(newOptions, true);
@@ -18629,12 +18641,14 @@ static void
 AttachPartitionEnsureIndexes(List **wqueue, Relation rel, Relation attachrel)
 {
 	List	   *idxes;
+	List	   *buildIdxes = NIL;
 	List	   *attachRelIdxs;
 	Relation   *attachrelIdxRels;
 	IndexInfo **attachInfos;
 	ListCell   *cell;
 	MemoryContext cxt;
 	MemoryContext oldcxt;
+	AttrMap    *attmap;
 
 	cxt = AllocSetContextCreate(CurrentMemoryContext,
 								"AttachPartitionEnsureIndexes",
@@ -18683,6 +18697,10 @@ AttachPartitionEnsureIndexes(List **wqueue, Relation rel, Relation attachrel)
 		goto out;
 	}
 
+	attmap = build_attrmap_by_name(RelationGetDescr(attachrel),
+								   RelationGetDescr(rel),
+								   false);
+
 	/*
 	 * For each index on the partitioned table, find a matching one in the
 	 * partition-to-be; if one is not found, create one.
@@ -18692,7 +18710,6 @@ AttachPartitionEnsureIndexes(List **wqueue, Relation rel, Relation attachrel)
 		Oid			idx = lfirst_oid(cell);
 		Relation	idxRel = index_open(idx, AccessShareLock);
 		IndexInfo  *info;
-		AttrMap    *attmap;
 		bool		found = false;
 		Oid			constraintOid;
 
@@ -18708,9 +18725,6 @@ AttachPartitionEnsureIndexes(List **wqueue, Relation rel, Relation attachrel)
 
 		/* construct an indexinfo to compare existing indexes against */
 		info = BuildIndexInfo(idxRel);
-		attmap = build_attrmap_by_name(RelationGetDescr(attachrel),
-									   RelationGetDescr(rel),
-									   false);
 		constraintOid = get_relation_idx_constraint_oid(RelationGetRelid(rel), idx);
 
 		/*
@@ -18776,19 +18790,7 @@ AttachPartitionEnsureIndexes(List **wqueue, Relation rel, Relation attachrel)
 		 * now.
 		 */
 		if (!found)
-		{
-			IndexStmt  *stmt;
-			Oid			conOid;
-
-			stmt = generateClonedIndexStmt(NULL,
-										   idxRel, attmap,
-										   &conOid);
-			DefineIndex(RelationGetRelid(attachrel), stmt, InvalidOid,
-						RelationGetRelid(idxRel),
-						conOid,
-						-1,
-						true, false, false, false, false);
-		}
+			buildIdxes = lappend_oid(buildIdxes, RelationGetRelid(idxRel));
 
 		index_close(idxRel, AccessShareLock);
 	}
@@ -18797,6 +18799,25 @@ out:
 	/* Clean up. */
 	for (int i = 0; i < list_length(attachRelIdxs); i++)
 		index_close(attachrelIdxRels[i], AccessShareLock);
+
+	foreach(cell, buildIdxes)
+	{
+		Oid			idx = lfirst_oid(cell);
+		Relation	idxRel = index_open(idx, AccessShareLock);
+		IndexStmt  *stmt;
+		Oid			conOid;
+
+		stmt = generateClonedIndexStmt(NULL,
+									   idxRel, attmap,
+									   &conOid);
+		DefineIndex(RelationGetRelid(attachrel), stmt, InvalidOid,
+					RelationGetRelid(idxRel),
+					conOid,
+					-1,
+					true, false, false, false, false);
+		index_close(idxRel, AccessShareLock);
+	}
+
 	MemoryContextSwitchTo(oldcxt);
 	MemoryContextDelete(cxt);
 }

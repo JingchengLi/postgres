@@ -119,9 +119,6 @@ static void UpdateIndexRelation(Oid indexoid, Oid heapoid,
 								bool immediate,
 								bool isvalid,
 								bool isready);
-static void index_update_stats(Relation rel,
-							   bool hasindex,
-							   double reltuples);
 static void IndexCheckExclusion(Relation heapRelation,
 								Relation indexRelation,
 								IndexInfo *indexInfo);
@@ -295,7 +292,7 @@ ConstructTupleDescriptor(Relation heapRelation,
 	int			i;
 
 	/* We need access to the index AM's API struct */
-	amroutine = GetIndexAmRoutineByAmId(accessMethodId, false);
+	amroutine = GetIndexAmRoutineByAmId(InvalidOid, accessMethodId, false);
 
 	/* ... and to the table's tuple descriptor */
 	heapTupDesc = RelationGetDescr(heapRelation);
@@ -2651,9 +2648,6 @@ BuildSpeculativeIndexInfo(Relation index, IndexInfo *ii)
 	 */
 	Assert(ii->ii_Unique);
 
-	if (index->rd_rel->relam != BTREE_AM_OID)
-		elog(ERROR, "unexpected non-btree speculative unique index");
-
 	ii->ii_UniqueOps = (Oid *) palloc(sizeof(Oid) * indnkeyatts);
 	ii->ii_UniqueProcs = (Oid *) palloc(sizeof(Oid) * indnkeyatts);
 	ii->ii_UniqueStrats = (uint16 *) palloc(sizeof(uint16) * indnkeyatts);
@@ -2777,7 +2771,7 @@ FormIndexDatum(IndexInfo *indexInfo,
  * index.  When updating an index, it's important because some index AMs
  * expect a relcache flush to occur after REINDEX.
  */
-static void
+void
 index_update_stats(Relation rel,
 				   bool hasindex,
 				   double reltuples)

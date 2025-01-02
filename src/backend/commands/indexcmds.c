@@ -71,6 +71,7 @@
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
+GetDefaultOpClass_hook_type GetDefaultOpClass_hook = NULL;
 
 /* non-export function prototypes */
 static bool CompareOpclassOptions(const Datum *opts1, const Datum *opts2, int natts);
@@ -91,11 +92,7 @@ static void ComputeIndexAttrs(IndexInfo *indexInfo,
 							  Oid ddl_userid,
 							  int ddl_sec_context,
 							  int *ddl_save_nestlevel);
-static char *ChooseIndexName(const char *tabname, Oid namespaceId,
-							 const List *colnames, const List *exclusionOpNames,
-							 bool primary, bool isconstraint);
 static char *ChooseIndexNameAddition(const List *colnames);
-static List *ChooseIndexColumnNames(const List *indexElems);
 static void ReindexIndex(const ReindexStmt *stmt, const ReindexParams *params,
 						 bool isTopLevel);
 static void RangeVarCallbackForReindexIndex(const RangeVar *relation,
@@ -223,7 +220,7 @@ CheckIndexCompatible(Oid oldId,
 						accessMethodName)));
 	accessMethodForm = (Form_pg_am) GETSTRUCT(tuple);
 	accessMethodId = accessMethodForm->oid;
-	amRoutine = GetIndexAmRoutine(accessMethodForm->amhandler);
+	amRoutine = GetIndexAmRoutineExtended(oldId, accessMethodForm->amhandler);
 	ReleaseSysCache(tuple);
 
 	amcanorder = amRoutine->amcanorder;
@@ -844,7 +841,7 @@ DefineIndex(Oid tableId,
 	}
 	accessMethodForm = (Form_pg_am) GETSTRUCT(tuple);
 	accessMethodId = accessMethodForm->oid;
-	amRoutine = GetIndexAmRoutine(accessMethodForm->amhandler);
+	amRoutine = GetIndexAmRoutineWithTableAM(rel->rd_rel->relam, accessMethodForm->amhandler);
 
 	pgstat_progress_update_param(PROGRESS_CREATEIDX_ACCESS_METHOD_OID,
 								 accessMethodId);
@@ -2317,6 +2314,9 @@ GetDefaultOpClass(Oid type_id, Oid am_id)
 	/* If it's a domain, look at the base type instead */
 	type_id = getBaseType(type_id);
 
+	if (GetDefaultOpClass_hook)
+		return GetDefaultOpClass_hook(type_id, am_id);
+
 	tcategory = TypeCategory(type_id);
 
 	/*
@@ -2532,7 +2532,7 @@ ChooseRelationName(const char *name1, const char *name2,
  *
  * The argument list is pretty ad-hoc :-(
  */
-static char *
+char *
 ChooseIndexName(const char *tabname, Oid namespaceId,
 				const List *colnames, const List *exclusionOpNames,
 				bool primary, bool isconstraint)
@@ -2621,7 +2621,7 @@ ChooseIndexNameAddition(const List *colnames)
  *
  * Returns a List of plain strings (char *, not String nodes).
  */
-static List *
+List *
 ChooseIndexColumnNames(const List *indexElems)
 {
 	List	   *result = NIL;

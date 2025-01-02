@@ -212,6 +212,7 @@ typedef struct TransactionStateData
 	bool		parallelChildXact;	/* is any parent transaction parallel? */
 	bool		chain;			/* start a new block after this one */
 	bool		topXidLogged;	/* for a subxact: is top-level XID logged? */
+	CommitSeqNo	csn;
 	struct TransactionStateData *parent;	/* back link to parent */
 } TransactionStateData;
 
@@ -245,6 +246,7 @@ static TransactionStateData TopTransactionStateData = {
 	.state = TRANS_DEFAULT,
 	.blockState = TBLOCK_DEFAULT,
 	.topXidLogged = false,
+	.csn = COMMITSEQNO_INPROGRESS
 };
 
 /*
@@ -323,6 +325,7 @@ typedef struct SubXactCallbackItem
 
 static SubXactCallbackItem *SubXact_callbacks = NULL;
 
+xact_redo_hook_type xact_redo_hook = NULL;
 
 /* local function prototypes */
 static void AssignTransactionId(TransactionState s);
@@ -2035,6 +2038,7 @@ StartTransaction(void)
 	 */
 	s->state = TRANS_START;
 	s->fullTransactionId = InvalidFullTransactionId;	/* until assigned */
+	s->csn = COMMITSEQNO_INPROGRESS;
 
 	/* Determine if statements are logged in this transaction */
 	xact_is_sampled = log_xact_sample_rate != 0 &&
@@ -2336,7 +2340,9 @@ CommitTransaction(void)
 	 * must be done _before_ releasing locks we hold and _after_
 	 * RecordTransactionCommit.
 	 */
+	MyProc->lastCommittedCSN = s->csn;
 	ProcArrayEndTransaction(MyProc, latestXid);
+	s->csn = MyProc->lastCommittedCSN;
 
 	/*
 	 * This is all post-commit cleanup.  Note that if an error is raised here,
@@ -2770,6 +2776,7 @@ AbortTransaction(void)
 	 * while cleaning up!
 	 */
 	LWLockReleaseAll();
+	CustomErrorCleanup();
 
 	/* Clear wait information and command progress indicator */
 	pgstat_report_wait_end();
@@ -5180,6 +5187,7 @@ AbortSubTransaction(void)
 	 * Buffer locks, for example?  I don't think so but I'm not sure.
 	 */
 	LWLockReleaseAll();
+	CustomErrorCleanup();
 
 	pgstat_report_wait_end();
 	pgstat_progress_end_command();
@@ -6073,6 +6081,9 @@ xact_redo_commit(xl_xact_parsed_commit *parsed,
 	TransactionId max_xid;
 	TimestampTz commit_time;
 
+	if (xact_redo_hook)
+		xact_redo_hook(xid, lsn);
+
 	Assert(TransactionIdIsValid(xid));
 
 	max_xid = TransactionIdLatest(xid, parsed->nsubxacts, parsed->subxacts);
@@ -6381,4 +6392,10 @@ xact_redo(XLogReaderState *record)
 	}
 	else
 		elog(PANIC, "xact_redo: unknown op code %u", info);
+}
+
+CommitSeqNo
+GetCurrentCSN(void)
+{
+	return TopTransactionStateData.csn;
 }

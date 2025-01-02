@@ -56,6 +56,7 @@ extern PGDLLIMPORT bool track_wal_io_timing;
 extern PGDLLIMPORT int wal_decode_buffer_size;
 
 extern PGDLLIMPORT int CheckPointSegments;
+extern PGDLLIMPORT CommitSeqNo startupCommitSeqNo;
 
 /* Archive modes */
 typedef enum ArchiveMode
@@ -292,6 +293,7 @@ extern void do_pg_backup_start(const char *backupidstr, bool fast,
 							   StringInfo tblspcmapfile);
 extern void do_pg_backup_stop(BackupState *state, bool waitforarchive);
 extern void do_pg_abort_backup(int code, Datum arg);
+extern bool have_backup_in_progress(void);
 extern void register_persistent_abort_backup_handler(void);
 extern SessionBackupState get_backup_status(void);
 
@@ -306,5 +308,15 @@ extern SessionBackupState get_backup_status(void);
 
 /* files to signal promotion to primary */
 #define PROMOTE_SIGNAL_FILE		"promote"
+
+typedef void (*CheckPoint_hook_type) (XLogRecPtr checkPointRedo, int flags);
+extern PGDLLIMPORT CheckPoint_hook_type CheckPoint_hook;
+extern double CheckPointProgress;
+typedef void (*after_checkpoint_cleanup_hook_type)(XLogRecPtr checkPointRedo,
+												   int flags);
+extern PGDLLIMPORT after_checkpoint_cleanup_hook_type
+	after_checkpoint_cleanup_hook;
+
+extern void (*RedoShutdownHook) (void);
 
 #endif							/* XLOG_H */

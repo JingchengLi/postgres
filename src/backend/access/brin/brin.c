@@ -273,7 +273,8 @@ brinhandler(PG_FUNCTION_ARGS)
 
 	amroutine->ambuild = brinbuild;
 	amroutine->ambuildempty = brinbuildempty;
-	amroutine->aminsert = brininsert;
+	amroutine->aminsert = NULL;
+	amroutine->aminsertextended = brininsert;
 	amroutine->aminsertcleanup = brininsertcleanup;
 	amroutine->ambulkdelete = brinbulkdelete;
 	amroutine->amvacuumcleanup = brinvacuumcleanup;
@@ -333,7 +334,7 @@ initialize_brin_insertstate(Relation idxRel, IndexInfo *indexInfo)
  */
 bool
 brininsert(Relation idxRel, Datum *values, bool *nulls,
-		   ItemPointer heaptid, Relation heapRel,
+		   Datum tupleid, Relation heapRel,
 		   IndexUniqueCheck checkUnique,
 		   bool indexUnchanged,
 		   IndexInfo *indexInfo)
@@ -348,6 +349,7 @@ brininsert(Relation idxRel, Datum *values, bool *nulls,
 	MemoryContext tupcxt = NULL;
 	MemoryContext oldcxt = CurrentMemoryContext;
 	bool		autosummarize = BrinGetAutoSummarize(idxRel);
+	ItemPointer heaptid = DatumGetItemPointer(tupleid);
 
 	/*
 	 * If first time through in this statement, initialize the insert state

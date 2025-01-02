@@ -54,11 +54,20 @@
 #include "storage/proc.h"
 #include "storage/procsignal.h"
 #include "storage/shmem.h"
+#include "storage/sinvaladt.h"
 #include "storage/smgr.h"
 #include "storage/spin.h"
 #include "utils/guc.h"
 #include "utils/memutils.h"
 #include "utils/resowner.h"
+#include "utils/syscache.h"
+
+/*
+ * Included for InitializeTimeouts and RegisterTimeout functions that
+ * needed for correct working of OrioleDB checkpoint.
+ * See comment for InitializeTimeouts call in CheckpointerMain for details.
+ */
+#include "utils/timeout.h"
 
 
 /*----------
@@ -205,6 +214,21 @@ CheckpointerMain(char *startup_data, size_t startup_data_len)
 	pqsignal(SIGCHLD, SIG_DFL);
 
 	/*
+	 * To use OrioleDB checkpoint, we must initialize the data for the primary
+	 * lock mechanism (lock.h) to work correctly. Because locks of this type are
+	 * needed by the OrioleDB module for debug events and relation locks, but
+	 * they are not used by the postgres checkpointer and are not initialized
+	 * for it.
+	 */
+	InitializeTimeouts(); /* establishes SIGALRM handler */
+	InitDeadLockChecking();
+	RegisterTimeout(DEADLOCK_TIMEOUT, CheckDeadLockAlert);
+	RelationCacheInitialize();
+	InitCatalogCache();
+	SharedInvalBackendInit(false);
+
+
+	/*
 	 * Initialize so that first time-driven event happens at the correct time.
 	 */
 	last_checkpoint_time = last_xlog_switch_time = (pg_time_t) time(NULL);
@@ -266,6 +290,7 @@ CheckpointerMain(char *startup_data, size_t startup_data_len)
 		 * files.
 		 */
 		LWLockReleaseAll();
+		CustomErrorCleanup();
 		ConditionVariableCancelSleep();
 		pgstat_report_wait_end();
 		UnlockBuffers();

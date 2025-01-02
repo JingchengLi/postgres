@@ -636,6 +636,27 @@ GetLockMethodLocalHash(void)
 #endif
 
 /*
+ * Returns true if any LOCKMODE lock with given locktag exist in LocalMethodLocalHash.
+ */
+bool
+DoLocalLockExist(const LOCKTAG *locktag)
+{
+	HASH_SEQ_STATUS scan_status;
+	LOCALLOCK* locallock;
+
+	hash_seq_init(&scan_status, LockMethodLocalHash);
+	while ((locallock = (LOCALLOCK *) hash_seq_search(&scan_status)) != NULL)
+	{
+		if (memcmp(&locallock->tag.lock, locktag, sizeof(LOCKTAG)) == 0)
+		{
+			hash_seq_term(&scan_status);
+			return true;
+		}
+	}
+	return false;
+}
+
+/*
  * LockHasWaiters -- look up 'locktag' and check if releasing this
  *		lock would wake up other processes waiting for it.
  */
@@ -784,7 +805,7 @@ LockAcquireExtended(const LOCKTAG *locktag,
 					bool reportMemoryError,
 					LOCALLOCK **locallockp)
 {
-	LOCKMETHODID lockmethodid = locktag->locktag_lockmethodid;
+	LOCKMETHODID lockmethodid;
 	LockMethod	lockMethodTable;
 	LOCALLOCKTAG localtag;
 	LOCALLOCK  *locallock;
@@ -796,6 +817,15 @@ LockAcquireExtended(const LOCKTAG *locktag,
 	LWLock	   *partitionLock;
 	bool		found_conflict;
 	bool		log_lock = false;
+	bool		no_log_lock = false;
+
+	if (locktag->locktag_lockmethodid == NO_LOG_LOCKMETHOD)
+	{
+		((LOCKTAG *)locktag)->locktag_lockmethodid = DEFAULT_LOCKMETHOD;
+		no_log_lock = true;
+	}
+
+	lockmethodid = locktag->locktag_lockmethodid;
 
 	if (lockmethodid <= 0 || lockmethodid >= lengthof(LockMethods))
 		elog(ERROR, "unrecognized lock method: %d", lockmethodid);
@@ -910,7 +940,8 @@ LockAcquireExtended(const LOCKTAG *locktag,
 	if (lockmode >= AccessExclusiveLock &&
 		locktag->locktag_type == LOCKTAG_RELATION &&
 		!RecoveryInProgress() &&
-		XLogStandbyInfoActive())
+		XLogStandbyInfoActive() &&
+		!no_log_lock)
 	{
 		LogAccessExclusiveLockPrepare();
 		log_lock = true;
@@ -1087,6 +1118,8 @@ LockAcquireExtended(const LOCKTAG *locktag,
 		 */
 		if (!(proclock->holdMask & LOCKBIT_ON(lockmode)))
 		{
+			int		i;
+
 			AbortStrongLockAcquire();
 
 			if (dontWait)
@@ -1136,7 +1169,27 @@ LockAcquireExtended(const LOCKTAG *locktag,
 				PROCLOCK_PRINT("LockAcquire: INCONSISTENT", proclock);
 				LOCK_PRINT("LockAcquire: INCONSISTENT", lock, lockmode);
 				LWLockRelease(partitionLock);
-				elog(ERROR, "LockAcquire failed");
+				/*
+				 * We've been removed from the queue without obtaining a lock.
+				 * That's OK, we're going to return LOCKACQUIRE_NOT_AVAIL, but
+				 * need to release a local lock first.
+				 */
+				locallock->nLocks--;
+				for (i = 0; i < locallock->numLockOwners; i++)
+				{
+					if (locallock->lockOwners[i].owner == owner)
+					{
+						locallock->lockOwners[i].nLocks--;
+						if (locallock->lockOwners[i].nLocks == 0)
+						{
+							ResourceOwnerForgetLock(owner, locallock);
+							locallock->lockOwners[i] = locallock->lockOwners[--locallock->numLockOwners];
+						}
+						break;
+					}
+				}
+
+				return LOCKACQUIRE_NOT_AVAIL;
 			}
 		}
 		PROCLOCK_PRINT("LockAcquire: granted", proclock);
@@ -4646,8 +4699,8 @@ VirtualXactLock(VirtualTransactionId vxid, bool wait)
 	LWLockRelease(&proc->fpInfoLock);
 
 	/* Time to wait. */
-	(void) LockAcquire(&tag, ShareLock, false, false);
-
+	if (LockAcquire(&tag, ShareLock, false, false) == LOCKACQUIRE_NOT_AVAIL)
+		return false;
 	LockRelease(&tag, ShareLock, false);
 	return XactLockForVirtualXact(vxid, xid, wait);
 }

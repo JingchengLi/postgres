@@ -127,7 +127,8 @@ bthandler(PG_FUNCTION_ARGS)
 
 	amroutine->ambuild = btbuild;
 	amroutine->ambuildempty = btbuildempty;
-	amroutine->aminsert = btinsert;
+	amroutine->aminsert = NULL;
+	amroutine->aminsertextended = btinsert;
 	amroutine->aminsertcleanup = NULL;
 	amroutine->ambulkdelete = btbulkdelete;
 	amroutine->amvacuumcleanup = btvacuumcleanup;
@@ -180,13 +181,14 @@ btbuildempty(Relation index)
  */
 bool
 btinsert(Relation rel, Datum *values, bool *isnull,
-		 ItemPointer ht_ctid, Relation heapRel,
+		 Datum tupleid, Relation heapRel,
 		 IndexUniqueCheck checkUnique,
 		 bool indexUnchanged,
 		 IndexInfo *indexInfo)
 {
 	bool		result;
 	IndexTuple	itup;
+	ItemPointer ht_ctid = DatumGetItemPointer(tupleid);
 
 	/* generate an index tuple */
 	itup = index_form_tuple(RelationGetDescr(rel), values, isnull);

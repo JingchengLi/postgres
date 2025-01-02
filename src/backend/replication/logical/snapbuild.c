@@ -219,6 +219,8 @@ struct SnapBuild
 	 */
 	TransactionId next_phase_at;
 
+	CSNSnapshotData csnSnapshotData;
+
 	/*
 	 * Array of transactions which could have catalog changes that committed
 	 * between xmin and xmax.
@@ -419,6 +421,17 @@ SnapBuildCurrentState(SnapBuild *builder)
 }
 
 /*
+ * An which transaction id the next phase of initial snapshot building will
+ * happen?
+ */
+TransactionId
+SnapBuildNextPhaseAt(SnapBuild *builder)
+{
+	return builder->next_phase_at;
+}
+
+
+/*
  * Return the LSN at which the two-phase decoding was first enabled.
  */
 XLogRecPtr
@@ -565,6 +578,8 @@ SnapBuildBuildSnapshot(SnapBuild *builder)
 	snapshot->regd_count = 0;
 	snapshot->snapXactCompletionCount = 0;
 
+	snapshot->csnSnapshotData = builder->csnSnapshotData;
+
 	return snapshot;
 }
 
@@ -662,6 +677,7 @@ SnapBuildInitialSnapshot(SnapBuild *builder)
 	snap->snapshot_type = SNAPSHOT_MVCC;
 	snap->xcnt = newxcnt;
 	snap->xip = newxip;
+	snap->csnSnapshotData = builder->csnSnapshotData;
 
 	return snap;
 }
@@ -1042,6 +1058,8 @@ SnapBuildCommitTxn(SnapBuild *builder, XLogRecPtr lsn, TransactionId xid,
 
 	TransactionId xmax = xid;
 
+	builder->csnSnapshotData.xlogptr = lsn;
+
 	/*
 	 * Transactions preceding BUILDING_SNAPSHOT will neither be decoded, nor
 	 * will they be part of a snapshot.  So we don't need to record anything.
@@ -1229,6 +1247,10 @@ SnapBuildProcessRunningXacts(SnapBuild *builder, XLogRecPtr lsn, xl_running_xact
 	ReorderBufferTXN *txn;
 	TransactionId xmin;
 
+	builder->csnSnapshotData.snapshotcsn = running->csn;
+	builder->csnSnapshotData.xmin = 0;
+	builder->csnSnapshotData.xlogptr = lsn;
+
 	/*
 	 * If we're not consistent yet, inspect the record to see whether it
 	 * allows to get closer to being consistent. If we are consistent, dump
@@ -1256,6 +1278,9 @@ SnapBuildProcessRunningXacts(SnapBuild *builder, XLogRecPtr lsn, xl_running_xact
 	 * we hit fast paths in heapam_visibility.c.
 	 */
 	builder->xmin = running->oldestRunningXid;
+	builder->csnSnapshotData.snapshotcsn = running->csn;
+	builder->csnSnapshotData.xmin = 0;
+	builder->csnSnapshotData.xlogptr = lsn;
 
 	/* Remove transactions we don't need to keep track off anymore */
 	SnapBuildPurgeOlderTxn(builder);
@@ -2173,4 +2198,11 @@ SnapBuildSnapshotExists(XLogRecPtr lsn)
 				 errmsg("could not stat file \"%s\": %m", path)));
 
 	return ret == 0;
+}
+
+void
+SnapBuildUpdateCSNSnaphot(SnapBuild *builder,
+						  CSNSnapshotData *csnSnapshotData)
+{
+	builder->csnSnapshotData = *csnSnapshotData;
 }
